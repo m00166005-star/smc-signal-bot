@@ -16,7 +16,7 @@ SYMBOLS = ["BTC-USDT", "ETH-USDT", "BNB-USDT", "XRP-USDT", "SOL-USDT",
 HTF = "1hour"
 ITF = "15min"
 LTF = "5min"
-MIN_SCORE = 45
+MIN_SCORE = 70  # ← فقط سیگنال‌های قوی ارسال بشن
 
 BASE_URL = "https://api.kucoin.com"
 
@@ -108,6 +108,34 @@ def calc_atr(candles, p=14):
            for i, c in enumerate(candles) if i > 0]
     return sum(trs[-p:]) / min(p, len(trs)) if trs else 0
 
+# ─── اضافه‌شده: EMA برای تأیید روند ───────────────────────────────────────────
+def calc_ema(candles, p=20):
+    closes = [c["close"] for c in candles]
+    if len(closes) < p:
+        return closes[-1] if closes else 0
+    k = 2 / (p + 1)
+    ema = sum(closes[:p]) / p
+    for price in closes[p:]:
+        ema = price * k + ema * (1 - k)
+    return ema
+
+# ─── اضافه‌شده: فیلتر حجم (آیا حجم فعلی بالاتر از میانگینه؟) ────────────────
+def volume_confirms(candles, multiplier=1.2):
+    if len(candles) < 20:
+        return False
+    avg_vol = sum(c["volume"] for c in candles[-20:-1]) / 19
+    last_vol = candles[-1]["volume"]
+    return last_vol >= avg_vol * multiplier
+
+# ─── اضافه‌شده: تأیید ITF ─────────────────────────────────────────────────────
+def itf_confirms(itf_candles, direction):
+    itf_struct, _ = detect_structure(itf_candles)
+    if direction == "LONG" and itf_struct == "BULLISH":
+        return True
+    if direction == "SHORT" and itf_struct == "BEARISH":
+        return True
+    return False
+
 def detect_session():
     h = datetime.now(timezone.utc).hour
     if 7 <= h < 12:
@@ -131,6 +159,11 @@ def analyze(symbol):
     ltf_struct, ltf_bos = detect_structure(ltf)
     bull_ob, bear_ob = find_ob(itf)
     bull_fvg, bear_fvg = find_fvg(itf)
+
+    # ─── اضافه‌شده: EMA و حجم ─────────────────────────────────────────────────
+    ema20 = calc_ema(ltf, 20)
+    ema50 = calc_ema(ltf, 50)
+    vol_ok = volume_confirms(ltf)
 
     results = []
     for direction in ["LONG", "SHORT"]:
@@ -200,6 +233,25 @@ def analyze(symbol):
             score += 10
             reasons.append(f"سشن {session}")
 
+        # ─── اضافه‌شده: EMA trend تأیید ──────────────────────────────────────
+        if direction == "LONG" and price > ema20 > ema50:
+            score += 10
+            reasons.append("EMA روند صعودی")
+        elif direction == "SHORT" and price < ema20 < ema50:
+            score += 10
+            reasons.append("EMA روند نزولی")
+
+        # ─── اضافه‌شده: تأیید حجم ────────────────────────────────────────────
+        if vol_ok:
+            score += 8
+            reasons.append("حجم بالا ✓")
+
+        # ─── اضافه‌شده: تأیید ITF ────────────────────────────────────────────
+        if itf_confirms(itf, direction):
+            score += 10
+            reasons.append("ITF هم‌راستا")
+
+        # ─── فقط score >= 70 قبول می‌شه ──────────────────────────────────────
         if score >= MIN_SCORE:
             if direction == "LONG":
                 sl = round(price - atr * 1.5, 6)
