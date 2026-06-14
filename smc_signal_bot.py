@@ -90,24 +90,20 @@ def score_symbol(symbol):
     long = 0
     short = 0
 
-    # TREND
     if e50 > e200:
         long += 40
     else:
         short += 40
 
-    # RSI
     if r < 40:
         long += 25
     elif r > 60:
         short += 25
 
-    # VOLATILITY
     if vol > price * 0.012:
         long += 15
         short += 15
 
-    # MICRO MOMENTUM
     if prices[-1] > prices[-2]:
         long += 10
     else:
@@ -122,7 +118,7 @@ def score_symbol(symbol):
     return {
         "symbol": symbol,
         "dir": direction,
-        "score": round(score, 2),
+        "score": score,
         "price": price,
         "sl": price * (0.98 if direction == "LONG" else 1.02),
         "tp": price * (1.03 if direction == "LONG" else 0.97)
@@ -132,14 +128,13 @@ def score_symbol(symbol):
 # ================= TELEGRAM =================
 def send(msg):
     if TOKEN and CHAT_ID:
-        session.post(
+        requests.post(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
             json={"chat_id": CHAT_ID, "text": msg},
             timeout=5
         )
 
 
-# ================= FORMAT (STICKER UI) =================
 def fmt(s):
 
     mood = "💎" if s["score"] > 80 else "🔥" if s["score"] > 65 else "⚡"
@@ -158,35 +153,41 @@ def fmt(s):
 """
 
 
-# ================= MAIN =================
+# ================= MAIN LOOP (AUTO 30 MIN) =================
+def run_scan():
+
+    results = []
+
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        outs = list(ex.map(score_symbol, SYMBOLS))
+
+    for o in outs:
+        if o:
+            results.append(o)
+
+    results = sorted(results, key=lambda x: x["score"], reverse=True)
+
+    top2 = results[:2]
+
+    if top2:
+        for t in top2:
+            send(fmt(t))
+    else:
+        send(f"⚪ NO STRONG SIGNAL {datetime.now()}")
+
+    send(f"SCAN DONE {datetime.now()}")
+
+
 def main():
 
-    print("PRO TOP-2 BOT STARTED")
+    print("AUTO 30M BOT STARTED")
 
     while True:
 
-        results = []
+        run_scan()
 
-        with ThreadPoolExecutor(max_workers=10) as ex:
-            outs = list(ex.map(score_symbol, SYMBOLS))
-
-        for o in outs:
-            if o:
-                results.append(o)
-
-        results = sorted(results, key=lambda x: x["score"], reverse=True)
-
-        top2 = results[:2]
-
-        if top2:
-            for t in top2:
-                send(fmt(t))
-        else:
-            send(f"⚪ NO STRONG SIGNAL {datetime.now()}")
-
-        send(f"SCAN DONE {datetime.now()}")
-
-        time.sleep(900)
+        # ⏱ هر 30 دقیقه
+        time.sleep(1800)
 
 
 if __name__ == "__main__":
