@@ -1,12 +1,10 @@
-#!/usr/bin/env python3
-
 import os
 import json
 import time
 import requests
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# ================= CONFIG =================
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
@@ -16,18 +14,18 @@ SYMBOLS = [
 "BTC-USDT","ETH-USDT","BNB-USDT","SOL-USDT","XRP-USDT",
 "DOGE-USDT","ADA-USDT","TRX-USDT","AVAX-USDT","LINK-USDT",
 "DOT-USDT","MATIC-USDT","LTC-USDT","BCH-USDT","ATOM-USDT",
-"NEAR-USDT","APT-USDT","ETC-USDT","UNI-USDT","FIL-USDT",
-"ARB-USDT","OP-USDT","INJ-USDT","SUI-USDT","SEI-USDT"
+"NEAR-USDT","APT-USDT","ETC-USDT","UNI-USDT","FIL-USDT"
 ]
 
 TF = "1hour"
 STATE_FILE = "state.json"
+LOG_FILE = "scan_log.txt"
 MIN_SCORE = 70
 
 session = requests.Session()
 
 
-# ───── STATE ─────
+# ================= STATE =================
 def load_state():
     try:
         return json.load(open(STATE_FILE))
@@ -38,17 +36,22 @@ def save_state(s):
     json.dump(s, open(STATE_FILE, "w"), indent=2)
 
 
-# ───── DATA ─────
+# ================= LOG =================
+def log(symbol, score, status, reasons):
+    with open(LOG_FILE, "a") as f:
+        f.write(f"{datetime.now()} | {symbol} | {score} | {status} | {reasons}\n")
+
+
+# ================= DATA =================
 def candles(symbol):
     try:
         r = session.get(
             f"{BASE}/api/v1/market/candles",
             params={"symbol": symbol, "type": TF},
-            timeout=6
+            timeout=8
         )
         data = r.json().get("data", [])
         return [{
-            "o": float(x[1]),
             "c": float(x[2]),
             "h": float(x[3]),
             "l": float(x[4]),
@@ -57,18 +60,16 @@ def candles(symbol):
         return []
 
 
-# ───── INDICATORS ─────
+# ================= INDICATORS =================
 def ema(data, p):
     c = [x["c"] for x in data]
     if len(c) < p:
         return c[-1] if c else 0
 
-    k = 2 / (p + 1)
-    e = sum(c[:p]) / p
-
+    k = 2/(p+1)
+    e = sum(c[:p])/p
     for v in c[p:]:
-        e = v * k + e * (1 - k)
-
+        e = v*k + e*(1-k)
     return e
 
 
@@ -88,7 +89,7 @@ def rsi(data):
     if down == 0:
         return 100
 
-    return 100 - (100 / (1 + up / down))
+    return 100 - (100/(1 + up/down))
 
 
 def atr(data):
@@ -102,6 +103,7 @@ def atr(data):
     return sum(tr[-10:]) / max(1, len(tr[-10:]))
 
 
+# ================= TREND =================
 def trend(data):
     highs = [x["h"] for x in data[-8:]]
     lows = [x["l"] for x in data[-8:]]
@@ -113,12 +115,35 @@ def trend(data):
     return "NEUTRAL"
 
 
-# ───── STATE CONTROL ─────
+# ================= TRADE LOCK =================
 def can_trade(symbol, state):
     return symbol not in state or state[symbol]["status"] != "OPEN"
 
 
-# ───── ANALYZE SINGLE SYMBOL ─────
+# ================= TELEGRAM =================
+def send(msg):
+    if TOKEN and CHAT_ID:
+        session.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": msg},
+            timeout=8
+        )
+
+
+def fmt(sig):
+    e = "🟢" if sig["dir"] == "LONG" else "🔴"
+    return f"""{e} SIGNAL
+────────────
+{sig['symbol']} | {sig['dir']}
+Score: {sig['score']}
+Entry: {sig['price']}
+SL: {sig['sl']}
+TP: {sig['tp']}
+────────────
+"""
+
+
+# ================= ANALYZE =================
 def analyze(symbol, state):
 
     c = candles(symbol)
@@ -134,98 +159,82 @@ def analyze(symbol, state):
     tr = trend(c)
 
     if not can_trade(symbol, state):
+        log(symbol, 0, "SKIP", ["OPEN TRADE"])
         return None
 
     for d in ["LONG", "SHORT"]:
 
         score = 0
+        reasons = []
 
         if d == "LONG" and e50 > e200:
             score += 35
+            reasons.append("Trend Up")
 
         if d == "SHORT" and e50 < e200:
             score += 35
+            reasons.append("Trend Down")
 
         if d == "LONG" and tr == "BULL":
             score += 20
+            reasons.append("Structure Bull")
 
         if d == "SHORT" and tr == "BEAR":
             score += 20
+            reasons.append("Structure Bear")
 
         if d == "LONG" and r < 45:
             score += 10
+            reasons.append("RSI Low")
 
         if d == "SHORT" and r > 55:
             score += 10
+            reasons.append("RSI High")
 
         if score < MIN_SCORE:
-            continue
+            log(symbol, score, "REJECT", reasons)
+            return None
 
-        sl = price - a * 2 if d == "LONG" else price + a * 2
-        tp = price + a * 3 if d == "LONG" else price - a * 3
+        sl = price - a*2 if d == "LONG" else price + a*2
+        tp = price + a*3 if d == "LONG" else price - a*3
 
-        return {
+        sig = {
             "symbol": symbol,
             "dir": d,
-            "score": round(score, 2),
+            "score": score,
             "price": price,
-            "sl": round(sl, 6),
-            "tp": round(tp, 6)
+            "sl": sl,
+            "tp": tp
         }
+
+        log(symbol, score, "ACCEPT", reasons)
+        state[symbol] = {"status": "OPEN", "dir": d, "time": str(datetime.now())}
+
+        return sig
 
     return None
 
 
-# ───── TELEGRAM ─────
-def send(msg):
-    session.post(
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        json={"chat_id": CHAT_ID, "text": msg},
-        timeout=6
-    )
-
-
-def fmt(s):
-    e = "🟢" if s["dir"] == "LONG" else "🔴"
-    return f"""{e} SIGNAL
-────────────
-{s['symbol']} | {s['dir']}
-Score: {s['score']}
-Entry: {s['price']}
-SL: {s['sl']}
-TP: {s['tp']}
-────────────
-"""
-
-
-# ───── MAIN PARALLEL ENGINE ─────
+# ================= MAIN LOOP =================
 def main():
 
-    print("PARALLEL BOT STARTED")
+    print("BOT STARTED")
 
     while True:
 
         state = load_state()
-        results = []
 
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        for s in SYMBOLS:
 
-            futures = {
-                executor.submit(analyze, s, state): s
-                for s in SYMBOLS
-            }
+            print("[SCAN]", s, datetime.now())
 
-            for f in as_completed(futures):
-                try:
-                    r = f.result()
-                    if r:
-                        results.append(r)
-                except:
-                    pass
+            sig = analyze(s, state)
 
-        for sig in results:
-            send(fmt(sig))
-            print("SIGNAL", sig["symbol"])
+            if sig:
+                send(fmt(sig))
+                print("SIGNAL:", s)
+
+            time.sleep(0.3)
 
         save_state(state)
 
@@ -236,3 +245,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
