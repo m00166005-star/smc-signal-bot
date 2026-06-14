@@ -443,28 +443,19 @@ RSI: {btc_rsi:.1f}
 def main():
     print("SMC Signal Bot Starting...")
     if not TELEGRAM_TOKEN:
-        print("خطا: TELEGRAM_TOKEN تنظیم نشده!")
+        print("خطا!")
         return
-    send_telegram("🔍 شروع اسکن...")
-    send_market_summary()
-    for symbol in SYMBOLS:
-        print(f"  {symbol}...", end=" ")
-        try:
-            sig = analyze_symbol(symbol)
-            if sig:
-                msg = format_signal_message(sig)
-                send_telegram(msg)
-                print(f"SIGNAL! {sig['direction']} score:{sig['score']}")
-            else:
-                send_telegram(f"⬜ {symbol}: سیگنال نیافت")
-                print("no signal")
-            time.sleep(1.5)
-        except Exception as ex:
-            send_telegram(f"❌ خطا در {symbol}: {ex}")
-            print(f"ERROR: {ex}")
-            time.sleep(2)
-    send_telegram("✅ اسکن تموم شد!")
-    print("اسکن تموم شد!")
+    
+    # تست یه ارز با لاگ کامل
+    symbol = "BTCUSDT"
+    for direction in ["LONG", "SHORT"]:
+        score, reasons, warnings, extras = score_signal(symbol, direction)
+        msg = f"🧪 تست {symbol} {direction}\n امتیاز: {score}\n"
+        if reasons:
+            msg += "✅ " + "\n✅ ".join(reasons)
+        if warnings:
+            msg += "\n⚠️ " + "\n⚠️ ".join(warnings)
+        send_telegram(msg)
 
 if __name__ == "__main__":
     main()
