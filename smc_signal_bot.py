@@ -12,7 +12,7 @@ SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "SOLUSDT", "ADAUSDT", "DO
 HTF = "1h"
 ITF = "15m"
 LTF = "5m"
-MIN_SCORE = 45
+MIN_SCORE = 20
 
 BASE_URL = "https://api.binance.com/api/v3"
 
