@@ -329,12 +329,21 @@ def analyze_symbol(symbol):
     itf_candles = get_klines(symbol, ITF, 100)
     if not ltf_candles or not itf_candles:
         return None
-    price = ltf_candles[-1]["close"]
-    _, _, ltf_choch = detect_market_structure(ltf_candles)
-    _, _, itf_choch = detect_market_structure(itf_candles)
-    itf_obs = find_order_blocks(itf_candles)
-    itf_fvgs = find_fvg(itf_candles)
-    signals = []
+    best_signal = None
+    best_score = 0
+    for direction in ["LONG", "SHORT"]:
+        score, reasons, warnings, extras = score_signal(symbol, direction)
+        if score >= MIN_SCORE and score > best_score:
+            best_score = score
+            best_signal = {
+                "symbol": symbol,
+                "direction": direction,
+                "score": score,
+                "reasons": reasons,
+                "warnings": warnings,
+                "extras": extras
+            }
+    return best_signal
     for direction in ["LONG", "SHORT"]:
         choch_signal = (
             (direction == "LONG" and ltf_choch == "BULLISH_CHoCH") or
