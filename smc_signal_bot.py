@@ -33,17 +33,31 @@ HTF, ITF, LTF = "1hour", "15min", "5min"
 #  STATE MANAGER - ضد تکرار
 # ══════════════════════════════════
 
+STATE_FILE = "/tmp/smc_state.json"
+
 def load_state():
     try:
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
+        r = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+            params={"limit": 1, "offset": -1}, timeout=10)
+        msgs = r.json().get("result", [])
+        for m in reversed(msgs):
+            text = m.get("message", {}).get("text", "")
+            if text.startswith("STATE:"):
+                return json.loads(text[6:])
     except:
-        return {"open_positions": {}}
+        pass
+    return {"open": {}}
 
 def save_state(state):
     try:
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f)
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": f"STATE:{json.dumps(state)}",
+                "disable_notification": True
+            }, timeout=10)
     except:
         pass
 
