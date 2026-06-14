@@ -253,14 +253,23 @@ def analyze(symbol):
 
         # ─── فقط score >= 70 قبول می‌شه ──────────────────────────────────────
         if score >= MIN_SCORE:
+            # حداقل فاصله 2% از قیمت برای SL و TP
+            min_dist = price * 0.02
+
             if direction == "LONG":
-                sl = round(price - atr * 1.5, 6)
-                tp1 = round(price + atr * 1.5, 6)
-                tp2 = round(price + atr * 3.0, 6)
+                sl_dist  = max(atr * 1.5, min_dist)
+                tp1_dist = max(atr * 1.5, min_dist)
+                tp2_dist = max(atr * 3.0, min_dist * 2)
+                sl  = round(price - sl_dist,  6)
+                tp1 = round(price + tp1_dist, 6)
+                tp2 = round(price + tp2_dist, 6)
             else:
-                sl = round(price + atr * 1.5, 6)
-                tp1 = round(price - atr * 1.5, 6)
-                tp2 = round(price - atr * 3.0, 6)
+                sl_dist  = max(atr * 1.5, min_dist)
+                tp1_dist = max(atr * 1.5, min_dist)
+                tp2_dist = max(atr * 3.0, min_dist * 2)
+                sl  = round(price + sl_dist,  6)
+                tp1 = round(price - tp1_dist, 6)
+                tp2 = round(price - tp2_dist, 6)
 
             rr = round(abs(tp2 - price) / abs(sl - price), 1) if abs(sl - price) > 0 else 0
 
