@@ -436,6 +436,7 @@ def main():
     if not TELEGRAM_TOKEN:
         print("خطا: TELEGRAM_TOKEN تنظیم نشده!")
         return
+    send_telegram("🔍 شروع اسکن...")
     send_market_summary()
     for symbol in SYMBOLS:
         print(f"  {symbol}...", end=" ")
@@ -446,11 +447,14 @@ def main():
                 send_telegram(msg)
                 print(f"SIGNAL! {sig['direction']} score:{sig['score']}")
             else:
+                send_telegram(f"⬜ {symbol}: سیگنال نیافت")
                 print("no signal")
             time.sleep(1.5)
         except Exception as ex:
+            send_telegram(f"❌ خطا در {symbol}: {ex}")
             print(f"ERROR: {ex}")
             time.sleep(2)
+    send_telegram("✅ اسکن تموم شد!")
     print("اسکن تموم شد!")
 
 if __name__ == "__main__":
