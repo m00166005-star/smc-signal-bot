@@ -1,265 +1,353 @@
 #!/usr/bin/env python3
 
 import os
-import json
-import time
 import requests
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 
-# ───── CONFIG ─────
-TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-BASE = "https://api.kucoin.com"
+SYMBOLS = ["BTC-USDT", "ETH-USDT", "BNB-USDT", "XRP-USDT", "SOL-USDT",
+           "ADA-USDT", "DOGE-USDT", "TRX-USDT", "AVAX-USDT", "SHIB-USDT",
+           "DOT-USDT", "LINK-USDT", "MATIC-USDT", "LTC-USDT", "UNI-USDT",
+           "ATOM-USDT", "XLM-USDT", "ETC-USDT", "APT-USDT", "NEAR-USDT"]
 
-SYMBOLS = [
-"BTC-USDT","ETH-USDT","BNB-USDT","SOL-USDT","XRP-USDT",
-"DOGE-USDT","ADA-USDT","TRX-USDT","AVAX-USDT","LINK-USDT",
-"DOT-USDT","MATIC-USDT","LTC-USDT","BCH-USDT","ATOM-USDT",
-"NEAR-USDT","APT-USDT","ETC-USDT","UNI-USDT","FIL-USDT",
-"ARB-USDT","OP-USDT","INJ-USDT","SEI-USDT","SUI-USDT",
-"PEPE-USDT","FLOKI-USDT","GALA-USDT","SAND-USDT","AXS-USDT",
-"IMX-USDT","RNDR-USDT","AAVE-USDT","CRV-USDT","MKR-USDT",
-"XLM-USDT","VET-USDT","HBAR-USDT","ICP-USDT","QNT-USDT",
-"ALGO-USDT","THETA-USDT","EOS-USDT","XTZ-USDT","KAVA-USDT",
-"ZEC-USDT","DASH-USDT","LDO-USDT","AR-USDT","STX-USDT"
-]
+HTF = "1hour"
+ITF = "15min"
+LTF = "5min"
+MIN_SCORE = 70  # ← فقط سیگنال‌های قوی ارسال بشن
 
-TF = "1hour"
-STATE_FILE = "state.json"
-MIN_SCORE = 60
+BASE_URL = "https://api.kucoin.com"
 
-
-# ───── STATE ─────
-def load_state():
+def get_klines(symbol, interval, limit=100):
+    url = f"{BASE_URL}/api/v1/market/candles"
+    params = {"symbol": symbol, "type": interval}
     try:
-        return json.load(open(STATE_FILE))
-    except:
-        return {}
-
-def save_state(s):
-    json.dump(s, open(STATE_FILE, "w"), indent=2)
-
-
-# ───── DATA ─────
-def candles(symbol):
-    try:
-        r = requests.get(
-            f"{BASE}/api/v1/market/candles",
-            params={"symbol": symbol, "type": TF},
-            timeout=10
-        )
-        data = r.json().get("data", [])
-        return [{
-            "o": float(x[1]),
-            "c": float(x[2]),
-            "h": float(x[3]),
-            "l": float(x[4]),
-            "v": float(x[5]),
-        } for x in reversed(data[:100])]
-    except:
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+        candles = []
+        for d in reversed(data.get("data", [])[:limit]):
+            candles.append({
+                "open":   float(d[1]),
+                "close":  float(d[2]),
+                "high":   float(d[3]),
+                "low":    float(d[4]),
+                "volume": float(d[5]),
+            })
+        return candles
+    except Exception as e:
+        print(f"[ERROR] {symbol}: {e}")
         return []
 
+def get_price(symbol):
+    try:
+        r = requests.get(f"{BASE_URL}/api/v1/market/stats", params={"symbol": symbol}, timeout=5)
+        data = r.json().get("data", {})
+        return float(data.get("last", 0)), float(data.get("changeRate", 0)) * 100
+    except:
+        return 0, 0
 
-# ───── INDICATORS ─────
-def ema(data, period):
-    prices = [x["c"] for x in data]
-    if len(prices) < period:
-        return prices[-1] if prices else 0
+def find_swing_points(candles, lookback=3):
+    highs, lows = [], []
+    n = len(candles)
+    for i in range(lookback, n - lookback):
+        if all(candles[i]["high"] > candles[j]["high"] for j in range(i-lookback, i+lookback+1) if j != i):
+            highs.append(candles[i]["high"])
+        if all(candles[i]["low"] < candles[j]["low"] for j in range(i-lookback, i+lookback+1) if j != i):
+            lows.append(candles[i]["low"])
+    return highs, lows
 
-    k = 2 / (period + 1)
-    e = sum(prices[:period]) / period
+def detect_structure(candles):
+    highs, lows = find_swing_points(candles)
+    if len(highs) < 2 or len(lows) < 2:
+        return "NEUTRAL", None
+    if highs[-1] > highs[-2] and lows[-1] > lows[-2]:
+        bos = "BULLISH_BOS" if candles[-1]["close"] > highs[-1] else None
+        return "BULLISH", bos
+    elif highs[-1] < highs[-2] and lows[-1] < lows[-2]:
+        bos = "BEARISH_BOS" if candles[-1]["close"] < lows[-1] else None
+        return "BEARISH", bos
+    return "NEUTRAL", None
 
-    for p in prices[period:]:
-        e = p * k + e * (1 - k)
+def find_ob(candles):
+    bull_obs, bear_obs = [], []
+    for i in range(2, len(candles)-2):
+        c, nc = candles[i], candles[i+1]
+        body = abs(c["close"] - c["open"])
+        next_body = abs(nc["close"] - nc["open"])
+        if c["close"] < c["open"] and nc["close"] > nc["open"] and next_body > body * 1.5:
+            bull_obs.append({"top": c["open"], "bottom": c["low"]})
+        if c["close"] > c["open"] and nc["close"] < nc["open"] and next_body > body * 1.5:
+            bear_obs.append({"top": c["high"], "bottom": c["open"]})
+    return bull_obs[-3:], bear_obs[-3:]
 
-    return e
+def find_fvg(candles):
+    bull_fvg, bear_fvg = [], []
+    for i in range(len(candles)-2):
+        if candles[i+2]["low"] > candles[i]["high"]:
+            bull_fvg.append({"top": candles[i+2]["low"], "bottom": candles[i]["high"]})
+        if candles[i+2]["high"] < candles[i]["low"]:
+            bear_fvg.append({"top": candles[i]["low"], "bottom": candles[i+2]["high"]})
+    return bull_fvg[-3:], bear_fvg[-3:]
 
-
-def rsi(data, period=14):
-    prices = [x["c"] for x in data]
-    if len(prices) < period + 1:
+def calc_rsi(candles, p=14):
+    closes = [c["close"] for c in candles]
+    if len(closes) < p+1:
         return 50
+    gains = [max(closes[i]-closes[i-1], 0) for i in range(1, len(closes))]
+    losses = [max(closes[i-1]-closes[i], 0) for i in range(1, len(closes))]
+    ag = sum(gains[-p:]) / p
+    al = sum(losses[-p:]) / p
+    return 100 - (100/(1+ag/al)) if al != 0 else 100
 
-    gains = 0
-    losses = 0
+def calc_atr(candles, p=14):
+    trs = [max(c["high"]-c["low"],
+               abs(c["high"]-candles[i-1]["close"]),
+               abs(c["low"]-candles[i-1]["close"]))
+           for i, c in enumerate(candles) if i > 0]
+    return sum(trs[-p:]) / min(p, len(trs)) if trs else 0
 
-    for i in range(1, period + 1):
-        diff = prices[-i] - prices[-i - 1]
-        if diff > 0:
-            gains += diff
-        else:
-            losses -= diff
+# ─── اضافه‌شده: EMA برای تأیید روند ───────────────────────────────────────────
+def calc_ema(candles, p=20):
+    closes = [c["close"] for c in candles]
+    if len(closes) < p:
+        return closes[-1] if closes else 0
+    k = 2 / (p + 1)
+    ema = sum(closes[:p]) / p
+    for price in closes[p:]:
+        ema = price * k + ema * (1 - k)
+    return ema
 
-    if losses == 0:
-        return 100
+# ─── اضافه‌شده: فیلتر حجم (آیا حجم فعلی بالاتر از میانگینه؟) ────────────────
+def volume_confirms(candles, multiplier=1.2):
+    if len(candles) < 20:
+        return False
+    avg_vol = sum(c["volume"] for c in candles[-20:-1]) / 19
+    last_vol = candles[-1]["volume"]
+    return last_vol >= avg_vol * multiplier
 
-    rs = gains / losses
-    return 100 - (100 / (1 + rs))
+# ─── اضافه‌شده: تأیید ITF ─────────────────────────────────────────────────────
+def itf_confirms(itf_candles, direction):
+    itf_struct, _ = detect_structure(itf_candles)
+    if direction == "LONG" and itf_struct == "BULLISH":
+        return True
+    if direction == "SHORT" and itf_struct == "BEARISH":
+        return True
+    return False
 
+def detect_session():
+    h = datetime.now(timezone.utc).hour
+    if 7 <= h < 12:
+        return "LONDON"
+    elif 12 <= h < 20:
+        return "NEWYORK"
+    return "ASIAN"
 
-def atr(data):
-    trs = []
-    for i in range(1, len(data)):
-        tr = max(
-            data[i]["h"] - data[i]["l"],
-            abs(data[i]["h"] - data[i-1]["c"]),
-            abs(data[i]["l"] - data[i-1]["c"])
-        )
-        trs.append(tr)
-
-    return sum(trs[-14:]) / max(1, len(trs[-14:]))
-
-
-# ───── STRUCTURE ─────
-def trend(data):
-    highs = [x["h"] for x in data[-10:]]
-    lows = [x["l"] for x in data[-10:]]
-
-    if highs[-1] > max(highs[:-1]) and lows[-1] > min(lows[:-1]):
-        return "BULL"
-    if highs[-1] < max(highs[:-1]) and lows[-1] < min(lows[:-1]):
-        return "BEAR"
-    return "NEUTRAL"
-
-
-# ───── STATE CHECK ─────
-def can_trade(symbol, state):
-    return symbol not in state or state[symbol]["status"] != "OPEN"
-
-
-def open_trade(symbol, sig, state):
-    state[symbol] = {
-        "status": "OPEN",
-        "dir": sig["dir"],
-        "entry": sig["price"],
-        "time": str(datetime.now())
-    }
-
-
-# ───── ANALYZE ─────
-def analyze(symbol, state):
-
-    c = candles(symbol)
-    if not c:
+def analyze(symbol):
+    htf = get_klines(symbol, HTF, 100)
+    itf = get_klines(symbol, ITF, 100)
+    ltf = get_klines(symbol, LTF, 50)
+    if not htf or not itf or not ltf:
         return None
 
-    price = c[-1]["c"]
+    price = ltf[-1]["close"]
+    atr = calc_atr(ltf)
+    rsi = calc_rsi(ltf)
+    session = detect_session()
+    htf_struct, _ = detect_structure(htf)
+    ltf_struct, ltf_bos = detect_structure(ltf)
+    bull_ob, bear_ob = find_ob(itf)
+    bull_fvg, bear_fvg = find_fvg(itf)
 
-    e50 = ema(c, 50)
-    e200 = ema(c, 200)
-    r = rsi(c)
-    a = atr(c)
-    tr = trend(c)
+    # ─── اضافه‌شده: EMA و حجم ─────────────────────────────────────────────────
+    ema20 = calc_ema(ltf, 20)
+    ema50 = calc_ema(ltf, 50)
+    vol_ok = volume_confirms(ltf)
 
-    for d in ["LONG", "SHORT"]:
-
-        if not can_trade(symbol, state):
-            continue
-
+    results = []
+    for direction in ["LONG", "SHORT"]:
         score = 0
         reasons = []
 
-        # trend
-        if d == "LONG" and e50 > e200:
-            score += 30
-            reasons.append("Trend Up")
+        # ساختار HTF
+        if direction == "LONG" and htf_struct == "BULLISH":
+            score += 25
+            reasons.append("HTF صعودی")
+        elif direction == "SHORT" and htf_struct == "BEARISH":
+            score += 25
+            reasons.append("HTF نزولی")
 
-        if d == "SHORT" and e50 < e200:
-            score += 30
-            reasons.append("Trend Down")
+        # BOS
+        if direction == "LONG" and ltf_bos == "BULLISH_BOS":
+            score += 15
+            reasons.append("BOS صعودی")
+        elif direction == "SHORT" and ltf_bos == "BEARISH_BOS":
+            score += 15
+            reasons.append("BOS نزولی")
 
-        # structure
-        if d == "LONG" and tr == "BULL":
-            score += 20
+        # Order Block
+        if direction == "LONG":
+            for ob in reversed(bull_ob):
+                if ob["bottom"] <= price <= ob["top"] * 1.01:
+                    score += 20
+                    reasons.append(f"Bullish OB")
+                    break
+        else:
+            for ob in reversed(bear_ob):
+                if ob["bottom"] * 0.99 <= price <= ob["top"]:
+                    score += 20
+                    reasons.append(f"Bearish OB")
+                    break
 
-        if d == "SHORT" and tr == "BEAR":
-            score += 20
+        # FVG
+        if direction == "LONG":
+            for fvg in reversed(bull_fvg):
+                if fvg["bottom"] <= price <= fvg["top"]:
+                    score += 15
+                    reasons.append("Bullish FVG")
+                    break
+        else:
+            for fvg in reversed(bear_fvg):
+                if fvg["bottom"] <= price <= fvg["top"]:
+                    score += 15
+                    reasons.append("Bearish FVG")
+                    break
 
         # RSI
-        if d == "LONG" and r < 45:
+        if direction == "LONG" and rsi < 35:
+            score += 15
+            reasons.append(f"RSI اشباع فروش ({rsi:.0f})")
+        elif direction == "LONG" and rsi < 50:
+            score += 8
+            reasons.append(f"RSI مناسب ({rsi:.0f})")
+        elif direction == "SHORT" and rsi > 65:
+            score += 15
+            reasons.append(f"RSI اشباع خرید ({rsi:.0f})")
+        elif direction == "SHORT" and rsi > 50:
+            score += 8
+            reasons.append(f"RSI مناسب ({rsi:.0f})")
+
+        # سشن
+        if session in ["LONDON", "NEWYORK"]:
             score += 10
+            reasons.append(f"سشن {session}")
 
-        if d == "SHORT" and r > 55:
+        # ─── اضافه‌شده: EMA trend تأیید ──────────────────────────────────────
+        if direction == "LONG" and price > ema20 > ema50:
             score += 10
+            reasons.append("EMA روند صعودی")
+        elif direction == "SHORT" and price < ema20 < ema50:
+            score += 10
+            reasons.append("EMA روند نزولی")
 
-        score += 5
+        # ─── اضافه‌شده: تأیید حجم ────────────────────────────────────────────
+        if vol_ok:
+            score += 8
+            reasons.append("حجم بالا ✓")
 
-        if score < MIN_SCORE:
-            continue
+        # ─── اضافه‌شده: تأیید ITF ────────────────────────────────────────────
+        if itf_confirms(itf, direction):
+            score += 10
+            reasons.append("ITF هم‌راستا")
 
-        sl = price - (a * 2) if d == "LONG" else price + (a * 2)
-        tp = price + (a * 3) if d == "LONG" else price - (a * 3)
+        # ─── فقط score >= 70 قبول می‌شه ──────────────────────────────────────
+        if score >= MIN_SCORE:
+            # حداقل فاصله: 2% برای SL و TP1، 4% برای TP2
+            sl_min  = price * 0.02
+            tp1_min = price * 0.02
+            tp2_min = price * 0.04
 
-        sig = {
-            "symbol": symbol,
-            "dir": d,
-            "score": round(score, 2),
-            "price": price,
-            "sl": round(sl, 6),
-            "tp": round(tp, 6),
-            "rsi": r
-        }
+            sl_dist  = max(atr * 1.5, sl_min)
+            tp1_dist = max(atr * 2.0, tp1_min)
+            tp2_dist = max(atr * 4.0, tp2_min)
 
-        open_trade(symbol, sig, state)
+            if direction == "LONG":
+                sl  = round(price - sl_dist,  6)
+                tp1 = round(price + tp1_dist, 6)
+                tp2 = round(price + tp2_dist, 6)
+            else:
+                sl  = round(price + sl_dist,  6)
+                tp1 = round(price - tp1_dist, 6)
+                tp2 = round(price - tp2_dist, 6)
 
-        return sig
+            rr = round(abs(tp2 - price) / abs(sl - price), 1) if abs(sl - price) > 0 else 0
 
-    return None
+            results.append({
+                "symbol": symbol,
+                "direction": direction,
+                "score": score,
+                "price": price,
+                "sl": sl,
+                "tp1": tp1,
+                "tp2": tp2,
+                "rr": rr,
+                "rsi": rsi,
+                "reasons": reasons,
+                "session": session
+            })
 
+    if not results:
+        return None
+    return max(results, key=lambda x: x["score"])
 
-# ───── TELEGRAM ─────
-def send(msg):
-    if not TOKEN or not CHAT_ID:
+def format_msg(s):
+    emoji = "🟢" if s["direction"] == "LONG" else "🔴"
+    dir_fa = "خرید (LONG)" if s["direction"] == "LONG" else "فروش (SHORT)"
+    quality = "💎 عالی" if s["score"] >= 70 else ("✨ خوب" if s["score"] >= 55 else "⚡ متوسط")
+    symbol_clean = s["symbol"].replace("-", "")
+
+    msg = f"""{emoji} سیگنال اسکلپ SMC
+{'─'*20}
+🪙 {symbol_clean} | {dir_fa}
+📊 کیفیت: {quality} ({s['score']}/100)
+{'─'*20}
+💰 قیمت ورود: {s['price']}
+🔴 استاپ لاس: {s['sl']}
+🎯 تیک پروفیت ۱: {s['tp1']}
+🎯 تیک پروفیت ۲: {s['tp2']}
+📐 ریسک به ریوارد: 1:{s['rr']}
+{'─'*20}
+📋 تأییدیه‌ها:"""
+    for r in s["reasons"]:
+        msg += f"\n• {r}"
+    msg += f"\n{'─'*20}"
+    msg += f"\n📊 RSI: {s['rsi']:.0f} | ⏰ {s['session']}"
+    msg += f"\n🕐 {datetime.now().strftime('%H:%M')}"
+    msg += f"\n⚠️ صرفاً آموزشی - ریسک با خودت"
+    return msg
+
+def send_telegram(msg):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+    except Exception as e:
+        print(f"[TG ERROR] {e}")
+
+def main():
+    print("SMC Bot Starting...")
+    if not TELEGRAM_TOKEN:
         return
 
-    requests.post(
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        json={"chat_id": CHAT_ID, "text": msg}
-    )
-
-
-def format(sig):
-    e = "🟢" if sig["dir"] == "LONG" else "🔴"
-
-    return f"""{e} SIGNAL
-────────────
-{sig['symbol']} | {sig['dir']}
-Score: {sig['score']}
-
-Entry: {sig['price']}
-SL: {sig['sl']}
-TP: {sig['tp']}
-RSI: {sig['rsi']}
-────────────
-"""
-
-
-# ───── MAIN ─────
-def main():
-
-    print("BOT STARTED")
-
-    while True:
-
-        state = load_state()
-
-        for s in SYMBOLS:
-
-            sig = analyze(s, state)
-
+    found = 0
+    for symbol in SYMBOLS:
+        print(f"  {symbol}...", end=" ")
+        try:
+            sig = analyze(symbol)
             if sig:
-                send(format(sig))
-                print("SIGNAL", s, sig["score"])
-
+                send_telegram(format_msg(sig))
+                found += 1
+                print(f"SIGNAL {sig['direction']} {sig['score']}")
+            else:
+                print("skip")
+            time.sleep(1)
+        except Exception as e:
+            print(f"ERR: {e}")
             time.sleep(1)
 
-        save_state(state)
-
-        send("SCAN DONE " + str(datetime.now()))
-
-        time.sleep(900)
-
+    if found == 0:
+        send_telegram(f"🔍 اسکن {len(SYMBOLS)} ارز تموم شد\n❌ سیگنال مناسب یافت نشد\n🕐 {datetime.now().strftime('%H:%M')}")
+    print(f"Done! {found} signals")
 
 if __name__ == "__main__":
     main()
