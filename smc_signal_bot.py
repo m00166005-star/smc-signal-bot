@@ -13,7 +13,6 @@ HTF = "1h"
 ITF = "15m"
 LTF = "5m"
 MIN_SCORE = 65
-CHECK_INTERVAL_MINUTES = 15
 
 BASE_URL = "https://api.binance.com/api/v3"
 
@@ -214,7 +213,7 @@ def score_signal(symbol, direction):
     price = ltf_candles[-1]["close"]
     atr = calculate_atr(ltf_candles)
     rsi_ltf = calculate_rsi(ltf_candles)
-    htf_struct, htf_bos, htf_choch = detect_market_structure(htf_candles)
+    htf_struct, _, _ = detect_market_structure(htf_candles)
     if direction == "LONG" and htf_struct == "BULLISH":
         score += 25
         reasons.append("HTF ساختار صعودی")
@@ -243,14 +242,14 @@ def score_signal(symbol, direction):
         if direction == "LONG" and ob["type"] == "BULLISH_OB":
             if ob["bottom"] <= price <= ob["top"] * 1.01:
                 score += 15
-                reasons.append(f"روی Bullish OB")
+                reasons.append("روی Bullish OB")
                 ob_hit = True
                 active_ob = ob
                 break
         elif direction == "SHORT" and ob["type"] == "BEARISH_OB":
             if ob["bottom"] * 0.99 <= price <= ob["top"]:
                 score += 15
-                reasons.append(f"روی Bearish OB")
+                reasons.append("روی Bearish OB")
                 ob_hit = True
                 active_ob = ob
                 break
@@ -437,30 +436,22 @@ def main():
     if not TELEGRAM_TOKEN:
         print("خطا: TELEGRAM_TOKEN تنظیم نشده!")
         return
-    send_telegram("🤖 SMC Bot شروع به کار کرد\n✅ اتصال برقرار\n📊 در حال اسکن بازار...")
-    print("ربات شروع شد!")
-    cycle = 0
-    while True:
-        cycle += 1
-        print(f"\n[Cycle {cycle}] {datetime.now().strftime('%H:%M:%S')}")
-        if cycle % 4 == 1:
-            send_market_summary()
-        for symbol in SYMBOLS:
-            print(f"  {symbol}...", end=" ")
-            try:
-                sig = analyze_symbol(symbol)
-                if sig:
-                    msg = format_signal_message(sig)
-                    send_telegram(msg)
-                    print(f"SIGNAL! {sig['direction']} score:{sig['score']}")
-                else:
-                    print("no signal")
-                time.sleep(1.5)
-            except Exception as ex:
-                print(f"ERROR: {ex}")
-                time.sleep(2)
-        print(f"Next scan in {CHECK_INTERVAL_MINUTES} min")
-        time.sleep(CHECK_INTERVAL_MINUTES * 60)
+    send_market_summary()
+    for symbol in SYMBOLS:
+        print(f"  {symbol}...", end=" ")
+        try:
+            sig = analyze_symbol(symbol)
+            if sig:
+                msg = format_signal_message(sig)
+                send_telegram(msg)
+                print(f"SIGNAL! {sig['direction']} score:{sig['score']}")
+            else:
+                print("no signal")
+            time.sleep(1.5)
+        except Exception as ex:
+            print(f"ERROR: {ex}")
+            time.sleep(2)
+    print("اسکن تموم شد!")
 
 if __name__ == "__main__":
     main()
