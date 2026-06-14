@@ -16,31 +16,40 @@ MIN_SCORE = 20
 
 BASE_URL = "https://api.binance.com/api/v3"
 
+BASE_URL = "https://api.kucoin.com"
+
 def get_klines(symbol, interval, limit=100):
-    url = f"{BASE_URL}/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    interval_map = {
+        "5m": "5min", "15m": "15min", "1h": "1hour"
+    }
+    kc_interval = interval_map.get(interval, "15min")
+    kc_symbol = symbol.replace("USDT", "-USDT")
+    url = f"{BASE_URL}/api/v1/market/candles"
+    params = {"symbol": kc_symbol, "type": kc_interval}
     try:
         r = requests.get(url, params=params, timeout=10)
         data = r.json()
         candles = []
-        for d in data:
+        for d in reversed(data.get("data", [])[:limit]):
             candles.append({
-                "open_time": d[0],
+                "open_time": int(d[0]),
                 "open":  float(d[1]),
-                "high":  float(d[2]),
-                "low":   float(d[3]),
-                "close": float(d[4]),
+                "close": float(d[2]),
+                "high":  float(d[3]),
+                "low":   float(d[4]),
                 "volume":float(d[5]),
             })
         return candles
     except Exception as e:
-        print(f"[ERROR] klines {symbol} {interval}: {e}")
+        print(f"[ERROR] klines {symbol}: {e}")
         return []
 
 def get_ticker(symbol):
+    kc_symbol = symbol.replace("USDT", "-USDT")
     try:
-        r = requests.get(f"{BASE_URL}/ticker/24hr", params={"symbol": symbol}, timeout=5)
-        return r.json()
+        r = requests.get(f"{BASE_URL}/api/v1/market/stats", params={"symbol": kc_symbol}, timeout=5)
+        data = r.json().get("data", {})
+        return {"priceChangePercent": float(data.get("changeRate", 0)) * 100}
     except:
         return {}
 
