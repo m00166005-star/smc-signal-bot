@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 
 import os
+import json
 import requests
 import time
 from datetime import datetime, timezone
 
+# ───────────────────────── CONFIG ─────────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
@@ -17,12 +19,44 @@ SYMBOLS = [
 "NEAR-USDT","APT-USDT","ETC-USDT","UNI-USDT","FIL-USDT"
 ]
 
-# ───────────────────────── TIMEFRAMES ─────────────────────────
-HTF = "4hour"
-ITF = "1hour"
 LTF = "15min"
+ITF = "1hour"
+HTF = "4hour"
 
-MIN_SCORE = 80
+MIN_SCORE = 75
+
+STATE_FILE = "state.json"
+
+# ───────────────────────── STATE ─────────────────────────
+def load_state():
+    try:
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+def can_trade(symbol, direction, state):
+    if symbol not in state:
+        return True
+
+    t = state[symbol]
+
+    if t.get("status") == "OPEN":
+        return False
+
+    return True
+
+def open_trade(symbol, sig, state):
+    state[symbol] = {
+        "status": "OPEN",
+        "direction": sig["direction"],
+        "entry": sig["price"],
+        "time": str(datetime.now())
+    }
 
 # ───────────────────────── DATA ─────────────────────────
 def get_klines(symbol, interval, limit=100):
@@ -30,9 +64,10 @@ def get_klines(symbol, interval, limit=100):
     params = {"symbol": symbol, "type": interval}
     try:
         r = requests.get(url, params=params, timeout=10)
-        data = r.json()
+        data = r.json().get("data", [])
         candles = []
-        for d in reversed(data.get("data", [])[:limit]):
+
+        for d in reversed(data[:limit]):
             candles.append({
                 "open": float(d[1]),
                 "close": float(d[2]),
@@ -40,52 +75,35 @@ def get_klines(symbol, interval, limit=100):
                 "low": float(d[4]),
                 "volume": float(d[5]),
             })
+
         return candles
     except:
         return []
 
-# ───────────────────────── STRUCTURE ─────────────────────────
-def find_swing_points(candles, lookback=3):
-    highs, lows = [], []
-    n = len(candles)
-    for i in range(lookback, n - lookback):
-        if all(candles[i]["high"] > candles[j]["high"] for j in range(i-lookback, i+lookback+1) if j != i):
-            highs.append(candles[i]["high"])
-        if all(candles[i]["low"] < candles[j]["low"] for j in range(i-lookback, i+lookback+1) if j != i):
-            lows.append(candles[i]["low"])
-    return highs, lows
-
-def detect_structure(candles):
-    highs, lows = find_swing_points(candles)
-    if len(highs) < 2 or len(lows) < 2:
-        return "NEUTRAL", None
-
-    if highs[-1] > highs[-2] and lows[-1] > lows[-2]:
-        return "BULLISH", None
-    if highs[-1] < highs[-2] and lows[-1] < lows[-2]:
-        return "BEARISH", None
-
-    return "NEUTRAL", None
-
 # ───────────────────────── INDICATORS ─────────────────────────
-def calc_rsi(candles, p=14):
+def rsi(candles, p=14):
     closes = [c["close"] for c in candles]
-    if len(closes) < p + 1:
+    if len(closes) < p:
         return 50
 
-    gains = [max(closes[i]-closes[i-1], 0) for i in range(1, len(closes))]
-    losses = [max(closes[i-1]-closes[i], 0) for i in range(1, len(closes))]
+    gains = []
+    losses = []
 
-    avg_gain = sum(gains[-p:]) / p
-    avg_loss = sum(losses[-p:]) / p
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i-1]
+        gains.append(max(diff, 0))
+        losses.append(max(-diff, 0))
 
-    if avg_loss == 0:
+    ag = sum(gains[-p:]) / p
+    al = sum(losses[-p:]) / p
+
+    if al == 0:
         return 100
 
-    rs = avg_gain / avg_loss
+    rs = ag / al
     return 100 - (100 / (1 + rs))
 
-def calc_atr(candles, p=14):
+def atr(candles, p=14):
     trs = []
     for i in range(1, len(candles)):
         tr = max(
@@ -95,26 +113,45 @@ def calc_atr(candles, p=14):
         )
         trs.append(tr)
 
-    if not trs:
-        return 0
+    return sum(trs[-p:]) / max(1, min(p, len(trs)))
 
-    return sum(trs[-p:]) / min(p, len(trs))
-
-def calc_ema(candles, p=50):
+def ema(candles, p=50):
     closes = [c["close"] for c in candles]
     if len(closes) < p:
         return closes[-1] if closes else 0
 
     k = 2 / (p + 1)
-    ema = sum(closes[:p]) / p
+    e = sum(closes[:p]) / p
 
     for price in closes[p:]:
-        ema = price * k + ema * (1 - k)
+        e = price * k + e * (1 - k)
 
-    return ema
+    return e
 
-# ───────────────────────── LIQUIDITY SWEEP ─────────────────────────
-def liquidity_sweep(candles):
+# ───────────────────────── STRUCTURE ─────────────────────────
+def structure(candles):
+    highs = []
+    lows = []
+
+    for i in range(3, len(candles)-3):
+        if all(candles[i]["high"] > candles[j]["high"] for j in range(i-3, i+4) if j != i):
+            highs.append(candles[i]["high"])
+        if all(candles[i]["low"] < candles[j]["low"] for j in range(i-3, i+4) if j != i):
+            lows.append(candles[i]["low"])
+
+    if len(highs) < 2:
+        return "NEUTRAL"
+
+    if highs[-1] > highs[-2] and lows[-1] > lows[-2]:
+        return "BULLISH"
+
+    if highs[-1] < highs[-2] and lows[-1] < lows[-2]:
+        return "BEARISH"
+
+    return "NEUTRAL"
+
+# ───────────────────────── LIQUIDITY ─────────────────────────
+def sweep(candles):
     if len(candles) < 10:
         return None
 
@@ -130,28 +167,9 @@ def liquidity_sweep(candles):
 
     return None
 
-# ───────────────────────── CHOCH ─────────────────────────
-def detect_choch(candles):
-    highs, lows = find_swing_points(candles)
-    if len(highs) < 3:
-        return None
-
-    if highs[-1] > highs[-2] and lows[-1] < lows[-2]:
-        return "CHOCH"
-
-    return None
-
-# ───────────────────────── SESSION ─────────────────────────
-def session():
-    h = datetime.now(timezone.utc).hour
-    if 7 <= h < 12:
-        return "LONDON"
-    if 12 <= h < 20:
-        return "NEWYORK"
-    return "ASIAN"
-
 # ───────────────────────── ANALYZE ─────────────────────────
-def analyze(symbol):
+def analyze(symbol, state):
+
     htf = get_klines(symbol, HTF)
     itf = get_klines(symbol, ITF)
     ltf = get_klines(symbol, LTF)
@@ -161,30 +179,32 @@ def analyze(symbol):
 
     price = ltf[-1]["close"]
 
-    rsi = calc_rsi(ltf)
-    atr = calc_atr(ltf)
+    r = rsi(ltf)
+    a = atr(ltf)
 
-    ema50 = calc_ema(htf, 50)
-    ema200 = calc_ema(htf, 200)
+    ema50 = ema(htf, 50)
+    ema200 = ema(htf, 200)
 
-    htf_struct, _ = detect_structure(htf)
-    sweep = liquidity_sweep(ltf)
-    choch = detect_choch(itf)
-
-    sess = session()
+    htf_struct = structure(htf)
+    sw = sweep(ltf)
 
     results = []
 
     for direction in ["LONG", "SHORT"]:
+
+        if not can_trade(symbol, direction, state):
+            continue
+
         score = 0
         reasons = []
 
         # trend
         if direction == "LONG" and ema50 > ema200:
-            score += 20
+            score += 25
             reasons.append("Trend Bullish")
+
         if direction == "SHORT" and ema50 < ema200:
-            score += 20
+            score += 25
             reasons.append("Trend Bearish")
 
         # structure
@@ -193,39 +213,34 @@ def analyze(symbol):
         if direction == "SHORT" and htf_struct == "BEARISH":
             score += 15
 
-        # liquidity sweep
-        if sweep == "BULLISH" and direction == "LONG":
-            score += 15
-            reasons.append("Liquidity Sweep")
-        if sweep == "BEARISH" and direction == "SHORT":
+        # sweep
+        if sw == "BULLISH" and direction == "LONG":
             score += 15
             reasons.append("Liquidity Sweep")
 
-        # CHOCH
-        if choch:
-            score += 10
-            reasons.append("CHOCH")
+        if sw == "BEARISH" and direction == "SHORT":
+            score += 15
+            reasons.append("Liquidity Sweep")
 
         # RSI
-        if direction == "LONG" and rsi < 40:
+        if direction == "LONG" and r < 40:
             score += 10
-        if direction == "SHORT" and rsi > 60:
+        if direction == "SHORT" and r > 60:
             score += 10
 
-        # session
-        if sess in ["LONDON", "NEWYORK"]:
-            score += 10
+        # session bonus
+        score += 5
 
         if score < MIN_SCORE:
             continue
 
-        sl = price - atr * 2 if direction == "LONG" else price + atr * 2
-        tp1 = price + atr * 3 if direction == "LONG" else price - atr * 3
-        tp2 = price + atr * 5 if direction == "LONG" else price - atr * 5
+        sl = price - a * 2 if direction == "LONG" else price + a * 2
+        tp1 = price + a * 3 if direction == "LONG" else price - a * 3
+        tp2 = price + a * 5 if direction == "LONG" else price - a * 5
 
         rr = abs(tp2 - price) / abs(sl - price)
 
-        results.append({
+        sig = {
             "symbol": symbol,
             "direction": direction,
             "score": score,
@@ -234,10 +249,13 @@ def analyze(symbol):
             "tp1": round(tp1, 6),
             "tp2": round(tp2, 6),
             "rr": round(rr, 2),
-            "rsi": rsi,
-            "reasons": reasons,
-            "session": sess
-        })
+            "rsi": r,
+            "reasons": reasons
+        }
+
+        open_trade(symbol, sig, state)
+
+        results.append(sig)
 
     return max(results, key=lambda x: x["score"]) if results else None
 
@@ -249,7 +267,7 @@ def send(msg):
 def format(sig):
     emoji = "🟢" if sig["direction"] == "LONG" else "🔴"
 
-    msg = f"""{emoji} SIGNAL
+    return f"""{emoji} SIGNAL
 ────────────────
 {sig['symbol']} | {sig['direction']}
 Score: {sig['score']}/100
@@ -261,28 +279,37 @@ TP2: {sig['tp2']}
 RR: 1:{sig['rr']}
 
 RSI: {sig['rsi']:.0f}
-Session: {sig['session']}
 ────────────────
 """
-    return msg
 
-# ───────────────────────── MAIN ─────────────────────────
+# ───────────────────────── MAIN LOOP ─────────────────────────
 def main():
+
     print("Bot Running...")
 
-    for s in SYMBOLS:
-        try:
-            sig = analyze(s)
-            if sig:
-                send(format(sig))
-                print("SIGNAL", s, sig["score"])
-            else:
-                print("skip", s)
-            time.sleep(1)
-        except:
-            continue
+    while True:
 
-    send(f"Scan done {datetime.now()}")
+        state = load_state()
+
+        for s in SYMBOLS:
+            try:
+                sig = analyze(s, state)
+                if sig:
+                    send(format(sig))
+                    print("SIGNAL", s, sig["score"])
+                else:
+                    print("skip", s)
+
+                time.sleep(1)
+
+            except Exception as e:
+                print("ERR", e)
+
+        save_state(state)
+
+        send("Scan done " + str(datetime.now()))
+
+        time.sleep(900)  # 15 minutes
 
 if __name__ == "__main__":
     main()
