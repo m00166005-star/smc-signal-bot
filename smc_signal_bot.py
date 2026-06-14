@@ -1,10 +1,9 @@
 import os
 import json
-import time
 import requests
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
-# ================= CONFIG =================
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
@@ -18,20 +17,10 @@ SYMBOLS = [
 ]
 
 TF = "1hour"
-STATE_FILE = "state.json"
 MIN_SCORE = 70
 
 session = requests.Session()
 
-# ================= STATE =================
-def load_state():
-    try:
-        return json.load(open(STATE_FILE))
-    except:
-        return {}
-
-def save_state(s):
-    json.dump(s, open(STATE_FILE, "w"), indent=2)
 
 # ================= DATA =================
 def candles(symbol):
@@ -39,137 +28,86 @@ def candles(symbol):
         r = session.get(
             f"{BASE}/api/v1/market/candles",
             params={"symbol": symbol, "type": TF},
-            timeout=8
+            timeout=5
         )
         data = r.json().get("data", [])
-        return [{
-            "c": float(x[2]),
-            "h": float(x[3]),
-            "l": float(x[4]),
-        } for x in reversed(data[:80])]
+        return [float(x[2]) for x in reversed(data[:80])]
     except:
         return []
 
-# ================= INDICATORS =================
-def ema(data, p):
-    c = [x["c"] for x in data]
-    if len(c) < p:
-        return c[-1] if c else 0
 
-    k = 2 / (p + 1)
-    e = sum(c[:p]) / p
+# ================= INDICATORS (LIGHT) =================
+def ema(prices, p):
+    if len(prices) < p:
+        return prices[-1] if prices else 0
 
-    for v in c[p:]:
-        e = v * k + e * (1 - k)
+    k = 2/(p+1)
+    e = sum(prices[:p])/p
+
+    for v in prices[p:]:
+        e = v*k + e*(1-k)
 
     return e
 
 
-def rsi(data):
-    c = [x["c"] for x in data]
-    if len(c) < 10:
+def rsi(prices):
+    if len(prices) < 15:
         return 50
 
-    up = down = 0
+    gains = 0
+    losses = 0
 
     for i in range(-10, -1):
-        diff = c[i] - c[i-1]
+        diff = prices[i] - prices[i-1]
         if diff > 0:
-            up += diff
+            gains += diff
         else:
-            down -= diff
+            losses -= diff
 
-    if down == 0:
+    if losses == 0:
         return 100
 
-    return 100 - (100 / (1 + up / down))
+    rs = gains / losses
+    return 100 - (100/(1+rs))
 
-
-def atr(data):
-    tr = []
-    for i in range(1, len(data)):
-        tr.append(max(
-            data[i]["h"] - data[i]["l"],
-            abs(data[i]["h"] - data[i-1]["c"]),
-            abs(data[i]["l"] - data[i-1]["c"])
-        ))
-    return sum(tr[-10:]) / max(1, len(tr[-10:]))
-
-# ================= TREND =================
-def trend(data):
-    highs = [x["h"] for x in data[-8:]]
-    lows = [x["l"] for x in data[-8:]]
-
-    if highs[-1] > max(highs[:-1]) and lows[-1] > min(lows[:-1]):
-        return "BULL"
-    if highs[-1] < max(highs[:-1]) and lows[-1] < min(lows[:-1]):
-        return "BEAR"
-    return "NEUTRAL"
-
-# ================= TELEGRAM LIVE =================
-def send_live():
-    r = session.post(
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        json={"chat_id": CHAT_ID, "text": "📊 Starting live scan..."}
-    )
-    return r.json()["result"]["message_id"]
-
-
-def edit_live(mid, text):
-    session.post(
-        f"https://api.telegram.org/bot{TOKEN}/editMessageText",
-        json={
-            "chat_id": CHAT_ID,
-            "message_id": mid,
-            "text": text
-        }
-    )
 
 # ================= ANALYZE =================
 def analyze(symbol):
 
-    c = candles(symbol)
-    if not c:
+    prices = candles(symbol)
+    if not prices:
         return None
 
-    price = c[-1]["c"]
+    price = prices[-1]
 
-    e50 = ema(c, 50)
-    e200 = ema(c, 200)
-    r = rsi(c)
-    a = atr(c)
-    tr = trend(c)
+    e50 = ema(prices, 50)
+    e200 = ema(prices, 200)
+    r = rsi(prices)
 
-    for d in ["LONG", "SHORT"]:
+    for direction in ["LONG", "SHORT"]:
 
         score = 0
 
-        if d == "LONG" and e50 > e200:
-            score += 35
+        if direction == "LONG" and e50 > e200:
+            score += 50
 
-        if d == "SHORT" and e50 < e200:
-            score += 35
+        if direction == "SHORT" and e50 < e200:
+            score += 50
 
-        if d == "LONG" and tr == "BULL":
-            score += 20
+        if direction == "LONG" and r < 45:
+            score += 30
 
-        if d == "SHORT" and tr == "BEAR":
-            score += 20
-
-        if d == "LONG" and r < 45:
-            score += 10
-
-        if d == "SHORT" and r > 55:
-            score += 10
+        if direction == "SHORT" and r > 55:
+            score += 30
 
         if score >= MIN_SCORE:
 
-            sl = price - a * 2 if d == "LONG" else price + a * 2
-            tp = price + a * 3 if d == "LONG" else price - a * 3
+            sl = price * (0.98 if direction == "LONG" else 1.02)
+            tp = price * (1.03 if direction == "LONG" else 0.97)
 
             return {
                 "symbol": symbol,
-                "dir": d,
+                "dir": direction,
                 "score": score,
                 "price": price,
                 "sl": sl,
@@ -178,60 +116,55 @@ def analyze(symbol):
 
     return None
 
-# ================= DASHBOARD =================
-def build_dashboard(signals, scanned):
 
-    text = "📊 LIVE CRYPTO SCANNER\n"
-    text += "────────────────────\n"
-    text += f"⏱ {datetime.now()}\n"
-    text += f"🔍 Scanned: {len(scanned)}\n"
-    text += f"🎯 Signals: {len(signals)}\n"
-    text += "────────────────────\n"
+# ================= TELEGRAM =================
+def send(msg):
+    if not TOKEN or not CHAT_ID:
+        return
 
-    for s in signals[-10:]:
+    session.post(
+        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+        json={"chat_id": CHAT_ID, "text": msg},
+        timeout=5
+    )
 
-        e = "🟢" if s["dir"] == "LONG" else "🔴"
 
-        text += f"{e} {s['symbol']} | {s['score']} | {s['dir']}\n"
+def format(sig):
+    e = "🟢" if sig["dir"] == "LONG" else "🔴"
 
-    if not signals:
-        text += "No valid signals\n"
+    return f"""{e} SIGNAL
+{sig['symbol']} | {sig['dir']}
+Score: {sig['score']}
+Entry: {sig['price']}
+SL: {sig['sl']}
+TP: {sig['tp']}
+{datetime.now()}
+"""
 
-    return text
 
-# ================= MAIN LOOP =================
+# ================= MAIN =================
+def worker(symbol):
+    try:
+        sig = analyze(symbol)
+        if sig:
+            send(format(sig))
+    except:
+        pass
+
+
 def main():
 
-    print("LIVE BOT STARTED")
-
-    mid = send_live()
-
-    state = load_state()
+    print("FAST BOT STARTED")
 
     while True:
 
-        signals = []
-        scanned = []
+        with ThreadPoolExecutor(max_workers=10) as exe:
+            exe.map(worker, SYMBOLS)
 
-        for s in SYMBOLS:
+        send(f"SCAN DONE {datetime.now()}")
 
-            scanned.append(s)
+        time.sleep(900)
 
-            sig = analyze(s)
 
-            if sig:
-                signals.append(sig)
-
-            time.sleep(0.3)
-
-        text = build_dashboard(signals, scanned)
-
-        edit_live(mid, text)
-
-        save_state(state)
-
-        time.sleep(15)
-
-# ================= RUN =================
 if __name__ == "__main__":
     main()
