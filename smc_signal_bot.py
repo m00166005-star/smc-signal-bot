@@ -772,13 +772,15 @@ def main():
     state = load_state()
     print(f"Open positions: {len(state['open'])}")
 
-    # ── چک پوزیشن‌های باز ──
+    # ── چک و گزارش پوزیشن‌های باز ──
     for key in list(state["open"].keys()):
         pos = state["open"].get(key)
         if not pos: continue
         ltf = get_klines(pos["symbol"], LTF, 5)
         if not ltf: continue
         cp = ltf[-1]["c"]
+
+        # چک SL/TP
         for p, result in check_closed(state, pos["symbol"], cp):
             if result == "SL":
                 send_sticker(STICKER_LOSS)
@@ -790,20 +792,30 @@ def main():
                 send_tg(f"✅ TP2 HIT\n"
                         f"{p['symbol'].replace('-','/')} {p['direction']}\n"
                         f"Entry: {p['entry']}  →  Exit: {cp}")
+
+        # گزارش وضعیت پوزیشن باز
+        if key in state["open"]:
+            entry = pos["entry"]
+            d = pos["direction"]
+            if d == "LONG":
+                pnl = round((cp - entry) / entry * 100, 2)
+            else:
+                pnl = round((entry - cp) / entry * 100, 2)
+            pnl_icon = "🟢" if pnl > 0 else "🔴"
+            sym = pos["symbol"].replace("-", "/")
+            send_tg(f"📊 POSITION UPDATE\n"
+                    f"{'━'*22}\n"
+                    f"🪙 {sym} {d}\n"
+                    f"💰 Entry:   {entry}\n"
+                    f"📍 Current: {cp}\n"
+                    f"{'━'*22}\n"
+                    f"{pnl_icon} PnL: {'+' if pnl>0 else ''}{pnl}%\n"
+                    f"🛑 SL:  {pos['sl']}\n"
+                    f"🎯 TP1: {pos['tp1']}\n"
+                    f"🎯 TP2: {pos['tp2']}")
         time.sleep(0.5)
 
-    # ── اگه پوزیشن باز داریم فقط همونا رو بفرست ──
-    open_positions = list(state["open"].values())
-    if open_positions:
-        send_sticker(STICKER_SIGNAL)
-        time.sleep(0.3)
-        for i, pos in enumerate(open_positions[:3], 1):
-            send_tg(format_open(pos, i))
-            time.sleep(0.8)
-        print(f"Sent {len(open_positions)} open positions")
-        return
-
-    # ── اسکن همه ارزها ──
+    # ── اسکن برای سیگنال جدید ──
     print(f"Scanning {len(SYMBOLS)} symbols...")
     candidates = []
 
@@ -811,9 +823,9 @@ def main():
         print(f"  {symbol}...", end=" ", flush=True)
         try:
             sig = analyze(symbol)
-            if sig:
+            if sig and not is_open(state, symbol, sig["direction"]):
                 candidates.append(sig)
-                print(f"✓ {sig['direction']} sc:{sig['score']} cf:{sig['conf']}")
+                print(f"✓ {sig['direction']} sc:{sig['score']}")
             else:
                 print("no")
             time.sleep(1.0)
@@ -834,11 +846,7 @@ def main():
             time.sleep(0.8)
         print(f"Sent {len(top)} signals")
     else:
-        now = datetime.now(timezone.utc).strftime("%H:%M")
-        send_tg(f"🔍 {len(SYMBOLS)} pairs scanned\n"
-                f"❌ No quality signals found\n"
-                f"🕐 {now} UTC")
-        print("No signals")
+        print("No new signals")
 
 if __name__ == "__main__":
     main()
