@@ -9,13 +9,29 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 def get_market_data():
-    # 1. Get Binance Tickers
-    binance_url = "https://api.binance.com/api/v3/ticker/24hr"
-    tickers = requests.get(binance_url).json()
+    # 1. Get Binance Tickers (Using api3 to avoid GitHub Action IP blocks)
+    binance_url = "https://api3.binance.com/api/v3/ticker/24hr"
+    try:
+        response = requests.get(binance_url)
+        tickers = response.json()
+        
+        # Check if the response is a list as expected
+        if not isinstance(tickers, list):
+            print(f"Warning: Binance API returned unexpected format or error: {tickers}")
+            tickers = []
+    except Exception as e:
+        print(f"Error fetching from Binance: {e}")
+        tickers = []
     
-    # Filter Top 20 USDT Volume
-    usdt_tickers = [t for t in tickers if t['symbol'].endswith('USDT') and 'UP' not in t['symbol'] and 'DOWN' not in t['symbol']]
-    usdt_tickers.sort(key=lambda x: float(x.get('quoteVolume', 0)), reverse=True)
+    # Filter Top 20 USDT Volume safely
+    usdt_tickers = []
+    for t in tickers:
+        if isinstance(t, dict) and 'symbol' in t:
+            sym = t['symbol']
+            if sym.endswith('USDT') and 'UP' not in sym and 'DOWN' not in sym:
+                usdt_tickers.append(t)
+                
+    usdt_tickers.sort(key=lambda x: float(x.get('quoteVolume', 0) or 0), reverse=True)
     top_20 = usdt_tickers[:20]
     
     # 2. Get Fear and Greed Index
@@ -31,11 +47,11 @@ def get_market_data():
     for t in top_20:
         market_data.append({
             "symbol": t['symbol'],
-            "priceChangePercent": t['priceChangePercent'],
-            "lastPrice": t['lastPrice'],
-            "highPrice": t['highPrice'],
-            "lowPrice": t['lowPrice'],
-            "quoteVolume": t['quoteVolume'],
+            "priceChangePercent": t.get('priceChangePercent', '0'),
+            "lastPrice": t.get('lastPrice', '0'),
+            "highPrice": t.get('highPrice', '0'),
+            "lowPrice": t.get('lowPrice', '0'),
+            "quoteVolume": t.get('quoteVolume', '0'),
             "fng_value": fng['value'],
             "fng_class": fng['value_classification']
         })
@@ -60,15 +76,19 @@ def ask_gemini(prompt):
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-    requests.post(url, json=payload)
+    try:
+        requests.post(url, json=payload)
+    except Exception as e:
+        print(f"Telegram Send Error: {e}")
 
 def main():
     print("Fetching market data...")
     coins = get_market_data()
     
-    # Cooldown check logic can be added here via a file database if needed, 
-    # but GitHub Actions starts fresh every run.
-    
+    if not coins:
+        print("No market data fetched. Exiting.")
+        return
+        
     for item in coins:
         print(f"Processing {item['symbol']}...")
         
