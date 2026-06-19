@@ -172,33 +172,50 @@ def send(msg):
         print("[TELEGRAM ERROR]", e)
 
 
-def fmt(signal):
+def fmt(s, rank):
 
-    mood = (
-        "💎"
-        if signal["score"] > 80
-        else "🔥"
-        if signal["score"] > 65
-        else "⚡"
-    )
+    medal = {
+        1: "🥇",
+        2: "🥈",
+        3: "🥉"
+    }.get(rank, "🏅")
 
-    arrow = "📈" if signal["dir"] == "LONG" else "📉"
-    side = "🟢 LONG" if signal["dir"] == "LONG" else "🔴 SHORT"
+    direction_emoji = "📈" if s["dir"] == "LONG" else "📉"
+    side = "LONG 🟢" if s["dir"] == "LONG" else "SHORT 🔴"
 
-    return f"""{mood} PRO SIGNAL {arrow}
-━━━━━━━━━━━━━━
-{side} | {signal['symbol']}
-🏆 Score: {signal['score']}
-💰 Entry: {signal['price']}
-🛑 SL: {signal['sl']}
-🎯 TP: {signal['tp']}
-━━━━━━━━━━━━━━
-🕒 {datetime.now().strftime('%H:%M:%S')}
+    confidence = min(s["score"], 99)
+
+    entry = s["price"]
+    sl = s["sl"]
+    tp1 = s["tp"]
+
+    if s["dir"] == "LONG":
+        tp2 = round(entry * 1.05, 6)
+        sl_pct = round(((entry - sl) / entry) * 100, 2)
+        tp1_pct = round(((tp1 - entry) / entry) * 100, 2)
+        tp2_pct = round(((tp2 - entry) / entry) * 100, 2)
+    else:
+        tp2 = round(entry * 0.95, 6)
+        sl_pct = round(((sl - entry) / entry) * 100, 2)
+        tp1_pct = round(((entry - tp1) / entry) * 100, 2)
+        tp2_pct = round(((entry - tp2) / entry) * 100, 2)
+
+    rr = round(tp2_pct / sl_pct, 1) if sl_pct else 0
+
+    return f"""
+{medal} {direction_emoji}  NEW SIGNAL  ·  {confidence}% Confidence
+┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
+  🪙  {s['symbol']}
+  📊  {side}
+  ⏰  LIVE MARKET 🌍
+┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
+  💰  Entry    {entry}
+  🛑  SL       {sl}  (-{sl_pct}%)
+  🎯  TP1      {tp1}  (+{tp1_pct}%)
+  🎯  TP2      {tp2}  (+{tp2_pct}%)
+  📐  R : R    1 : {rr}
+┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
 """
-
-
-# ================= SCAN =================
-
 def run_scan():
 
     results = []
