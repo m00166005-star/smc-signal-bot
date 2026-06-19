@@ -10,10 +10,10 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 BASE = "https://api.kucoin.com"
 
 SYMBOLS = [
-"BTC-USDT","ETH-USDT","BNB-USDT","SOL-USDT","XRP-USDT",
-"DOGE-USDT","ADA-USDT","TRX-USDT","AVAX-USDT","LINK-USDT",
-"DOT-USDT","MATIC-USDT","LTC-USDT","BCH-USDT","ATOM-USDT",
-"NEAR-USDT","APT-USDT","ETC-USDT","UNI-USDT","FIL-USDT"
+    "BTC-USDT", "ETH-USDT", "BNB-USDT", "SOL-USDT", "XRP-USDT",
+    "DOGE-USDT", "ADA-USDT", "TRX-USDT", "AVAX-USDT", "LINK-USDT",
+    "DOT-USDT", "MATIC-USDT", "LTC-USDT", "BCH-USDT", "ATOM-USDT",
+    "NEAR-USDT", "APT-USDT", "ETC-USDT", "UNI-USDT", "FIL-USDT"
 ]
 
 TF = "1hour"
@@ -21,29 +21,41 @@ session = requests.Session()
 
 
 # ================= DATA =================
+
 def candles(symbol):
     try:
         r = session.get(
             f"{BASE}/api/v1/market/candles",
             params={"symbol": symbol, "type": TF},
-            timeout=5
+            timeout=10
         )
+
+        if r.status_code != 200:
+            return []
+
         data = r.json().get("data", [])
+
+        if not data:
+            return []
+
         return [float(x[2]) for x in reversed(data[:100])]
-    except:
+
+    except Exception as e:
+        print(f"[DATA ERROR] {symbol}: {e}")
         return []
 
 
 # ================= INDICATORS =================
+
 def ema(data, p):
     if len(data) < p:
         return data[-1] if data else 0
 
-    k = 2/(p+1)
-    e = sum(data[:p])/p
+    k = 2 / (p + 1)
+    e = sum(data[:p]) / p
 
     for v in data[p:]:
-        e = v*k + e*(1-k)
+        e = v * k + e * (1 - k)
 
     return e
 
@@ -56,7 +68,8 @@ def rsi(data):
     loss = 0
 
     for i in range(-14, -1):
-        diff = data[i] - data[i-1]
+        diff = data[i] - data[i - 1]
+
         if diff > 0:
             gain += diff
         else:
@@ -66,117 +79,160 @@ def rsi(data):
         return 100
 
     rs = gain / loss
-    return 100 - (100/(1+rs))
+    return 100 - (100 / (1 + rs))
 
 
 def volatility(data):
+    if len(data) < 15:
+        return 0
+
     return max(data[-15:]) - min(data[-15:])
 
 
 # ================= SCORING =================
+
 def score_symbol(symbol):
 
     prices = candles(symbol)
-    if not prices:
+
+    if len(prices) < 20:
         return None
 
     price = prices[-1]
 
     e50 = ema(prices, 50)
     e200 = ema(prices, 200)
+
     r = rsi(prices)
     vol = volatility(prices)
 
-    long = 0
-    short = 0
+    long_score = 0
+    short_score = 0
 
     if e50 > e200:
-        long += 40
+        long_score += 40
     else:
-        short += 40
+        short_score += 40
 
     if r < 40:
-        long += 25
+        long_score += 25
     elif r > 60:
-        short += 25
+        short_score += 25
 
     if vol > price * 0.012:
-        long += 15
-        short += 15
+        long_score += 15
+        short_score += 15
 
     if prices[-1] > prices[-2]:
-        long += 10
+        long_score += 10
     else:
-        short += 10
+        short_score += 10
 
-    if long < 55 and short < 55:
+    if long_score < 55 and short_score < 55:
         return None
 
-    direction = "LONG" if long >= short else "SHORT"
-    score = max(long, short)
+    direction = "LONG" if long_score >= short_score else "SHORT"
+    score = max(long_score, short_score)
 
     return {
         "symbol": symbol,
         "dir": direction,
         "score": score,
-        "price": price,
-        "sl": price * (0.98 if direction == "LONG" else 1.02),
-        "tp": price * (1.03 if direction == "LONG" else 0.97)
+        "price": round(price, 6),
+        "sl": round(
+            price * (0.98 if direction == "LONG" else 1.02),
+            6
+        ),
+        "tp": round(
+            price * (1.03 if direction == "LONG" else 0.97),
+            6
+        )
     }
 
 
 # ================= TELEGRAM =================
+
 def send(msg):
-    if TOKEN and CHAT_ID:
+
+    if not TOKEN or not CHAT_ID:
+        print("[WARNING] TELEGRAM TOKEN OR CHAT ID MISSING")
+        return
+
+    try:
         requests.post(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": msg},
-            timeout=5
+            json={
+                "chat_id": CHAT_ID,
+                "text": msg
+            },
+            timeout=10
         )
 
+    except Exception as e:
+        print("[TELEGRAM ERROR]", e)
 
-def fmt(s):
 
-    mood = "💎" if s["score"] > 80 else "🔥" if s["score"] > 65 else "⚡"
-    arrow = "📈" if s["dir"] == "LONG" else "📉"
-    side = "🟢 LONG" if s["dir"] == "LONG" else "🔴 SHORT"
+def fmt(signal):
+
+    mood = (
+        "💎"
+        if signal["score"] > 80
+        else "🔥"
+        if signal["score"] > 65
+        else "⚡"
+    )
+
+    arrow = "📈" if signal["dir"] == "LONG" else "📉"
+    side = "🟢 LONG" if signal["dir"] == "LONG" else "🔴 SHORT"
 
     return f"""{mood} PRO SIGNAL {arrow}
 ━━━━━━━━━━━━━━
-{side} | {s['symbol']}
-🏆 Score: {s['score']}
-💰 Entry: {s['price']}
-🛑 SL: {s['sl']}
-🎯 TP: {s['tp']}
+{side} | {signal['symbol']}
+🏆 Score: {signal['score']}
+💰 Entry: {signal['price']}
+🛑 SL: {signal['sl']}
+🎯 TP: {signal['tp']}
 ━━━━━━━━━━━━━━
 🕒 {datetime.now().strftime('%H:%M:%S')}
 """
 
 
-# ================= MAIN LOOP (AUTO 30 MIN) =================
+# ================= SCAN =================
+
 def run_scan():
 
     results = []
 
-    with ThreadPoolExecutor(max_workers=10) as ex:
-        outs = list(ex.map(score_symbol, SYMBOLS))
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        outputs = list(executor.map(score_symbol, SYMBOLS))
 
-    for o in outs:
-        if o:
-            results.append(o)
+    for result in outputs:
+        if result:
+            results.append(result)
 
-    results = sorted(results, key=lambda x: x["score"], reverse=True)
+    results.sort(
+        key=lambda x: x["score"],
+        reverse=True
+    )
 
-    top2 = results[:2]
+    top_signals = results[:2]
 
-    if top2:
-        for t in top2:
-            send(fmt(t))
+    if top_signals:
+
+        for signal in top_signals:
+            send(fmt(signal))
+
     else:
-        send(f"⚪ NO STRONG SIGNAL {datetime.now()}")
+        send(
+            f"⚪ NO STRONG SIGNAL\n{datetime.now()}"
+        )
 
-    send(f"SCAN DONE {datetime.now()}")
+    send(
+        f"SCAN DONE {datetime.now()}"
+    )
 
+
+# ================= MAIN =================
 
 def main():
 
@@ -184,11 +240,18 @@ def main():
 
     while True:
 
-        run_scan()
+        try:
 
-        # ⏱ هر 30 دقیقه
+            run_scan()
+
+        except Exception as e:
+
+            print("[BOT ERROR]", e)
+
         time.sleep(1800)
 
 
-if name == "main":
+# ================= START =================
+
+if __name__ == "__main__":
     main()
