@@ -3,6 +3,8 @@ import time
 import requests
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -17,18 +19,28 @@ SYMBOLS = [
 ]
 
 TF = "1hour"
+HTF = "4hour"
+
+# resilient HTTP session: automatic retry on timeouts / rate limits / 5xx
 session = requests.Session()
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=0.6,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET"]
+)
+session.mount("https://", HTTPAdapter(max_retries=retry_strategy))
 
 
 # ================= DATA =================
 
-def candles(symbol):
+def candles(symbol, tf=TF, limit=220):
     """Fetch OHLCV candles from KuCoin. Returns closes, highs, lows, volumes
-    (all in chronological order, oldest -> newest)."""
+    (chronological order, oldest -> newest)."""
     try:
         r = session.get(
             f"{BASE}/api/v1/market/candles",
-            params={"symbol": symbol, "type": TF},
+            params={"symbol": symbol, "type": tf},
             timeout=10
         )
 
@@ -41,8 +53,7 @@ def candles(symbol):
             return [], [], [], []
 
         # KuCoin format: [time, open, close, high, low, volume, turnover]
-        # newest first -> take up to 220 candles then reverse to chronological
-        chunk = list(reversed(data[:220]))
+        chunk = list(reversed(data[:limit]))
 
         closes = [float(x[2]) for x in chunk]
         highs = [float(x[3]) for x in chunk]
@@ -52,15 +63,17 @@ def candles(symbol):
         return closes, highs, lows, volumes
 
     except Exception as e:
-        print(f"[DATA ERROR] {symbol}: {e}")
+        print(f"[DATA ERROR] {symbol} ({tf}): {e}")
         return [], [], [], []
 
 
 # ================= INDICATORS =================
 
 def ema_val(data, period):
+    if not data:
+        return 0
     if len(data) < period:
-        return data[-1] if data else 0
+        return data[-1]
 
     k = 2 / (period + 1)
     e = sum(data[:period]) / period
@@ -72,7 +85,6 @@ def ema_val(data, period):
 
 
 def ema_list(data, period):
-    """Full EMA series aligned to data, None where not enough history yet."""
     if len(data) < period:
         return [None] * len(data)
 
@@ -210,104 +222,208 @@ def atr_val(highs, lows, closes, period=14):
     return sum(trs[-period:]) / period
 
 
-# ================= SCORING =================
+def _wilder_smooth(values, period):
+    if len(values) < period + 1:
+        return [0.0] * len(values)
 
-def score_symbol(symbol):
+    result = [None] * period
+    total = sum(values[1:period + 1])
+    result.append(total)
+    prev = total
 
-    closes, highs, lows, volumes = candles(symbol)
+    for v in values[period + 1:]:
+        prev = prev - (prev / period) + v
+        result.append(prev)
+
+    return result
+
+
+def adx_val(highs, lows, closes, period=14):
+    """Approximate Wilder ADX - measures trend strength (0-100).
+    Used only as a trend/no-trend gate, not for precision trading."""
+    if len(closes) < period * 2:
+        return 0
+
+    plus_dm = [0.0]
+    minus_dm = [0.0]
+    trs = [0.0]
+
+    for i in range(1, len(closes)):
+        up_move = highs[i] - highs[i - 1]
+        down_move = lows[i - 1] - lows[i]
+
+        plus_dm.append(up_move if (up_move > down_move and up_move > 0) else 0.0)
+        minus_dm.append(down_move if (down_move > up_move and down_move > 0) else 0.0)
+
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1])
+        )
+        trs.append(tr)
+
+    tr_s = _wilder_smooth(trs, period)
+    plus_s = _wilder_smooth(plus_dm, period)
+    minus_s = _wilder_smooth(minus_dm, period)
+
+    dx_values = []
+    for t, p, m in zip(tr_s, plus_s, minus_s):
+        if not t:
+            continue
+        pdi = 100 * p / t
+        mdi = 100 * m / t
+        denom = pdi + mdi
+        dx_values.append(0 if denom == 0 else 100 * abs(pdi - mdi) / denom)
+
+    if not dx_values:
+        return 0
+
+    if len(dx_values) < period:
+        return dx_values[-1]
+
+    return sum(dx_values[-period:]) / period
+
+
+# ================= HIGHER TIMEFRAME TREND =================
+
+def htf_trend(symbol):
+    """Returns 'LONG', 'SHORT', or None (unknown / not enough data)."""
+    closes, _, _, _ = candles(symbol, tf=HTF, limit=220)
 
     if len(closes) < 60:
         return None
 
-    price = closes[-1]
-
-    long_score = 0
-    short_score = 0
-
-    # 1) Trend filter - EMA50 vs EMA200 (weight 20)
     e50 = ema_val(closes, 50)
     e200 = ema_val(closes, min(200, len(closes) - 1))
-    if e50 > e200:
-        long_score += 20
-    else:
-        short_score += 20
 
-    # 2) MACD crossover + histogram momentum (weight 20)
-    macd_now, signal_now, hist_now, macd_prev, hist_prev = macd_values(closes)
-    if macd_now > signal_now:
-        long_score += 12
-    else:
-        short_score += 12
-    if hist_now > hist_prev:
-        long_score += 8
-    else:
-        short_score += 8
+    return "LONG" if e50 > e200 else "SHORT"
 
-    # 3) RSI zone (weight 15)
-    rsi_now = rsi_list(closes)[-1] or 50
-    if rsi_now < 35:
-        long_score += 15
-    elif rsi_now > 65:
-        short_score += 15
-    elif rsi_now < 50:
-        short_score += 5
-    else:
-        long_score += 5
 
-    # 4) Stochastic RSI momentum (weight 15)
-    srsi = stoch_rsi_val(closes)
-    if srsi < 20:
-        long_score += 15
-    elif srsi > 80:
-        short_score += 15
+# ================= SCORING =================
 
-    # 5) Bollinger Bands position (weight 15)
-    upper, mid, lower = bollinger(closes)
-    if price <= lower:
-        long_score += 15
-    elif price >= upper:
-        short_score += 15
-    elif price < mid:
-        short_score += 5
-    else:
-        long_score += 5
+def score_symbol(symbol):
 
-    # 6) OBV volume trend confirmation (weight 15)
-    obv_diff = obv_trend(closes, volumes)
-    if obv_diff > 0:
-        long_score += 15
-    elif obv_diff < 0:
-        short_score += 15
+    try:
+        closes, highs, lows, volumes = candles(symbol)
 
-    if long_score < 65 and short_score < 65:
+        if len(closes) < 60:
+            return None
+
+        price = closes[-1]
+
+        # --- gate 1: trend strength (skip choppy/ranging markets) ---
+        adx = adx_val(highs, lows, closes)
+        if adx and adx < 18:
+            return None
+
+        long_score = 0
+        short_score = 0
+
+        # 1) Trend filter - EMA50 vs EMA200 (weight 20)
+        e50 = ema_val(closes, 50)
+        e200 = ema_val(closes, min(200, len(closes) - 1))
+        if e50 > e200:
+            long_score += 20
+        else:
+            short_score += 20
+
+        # 2) MACD crossover + histogram momentum (weight 20)
+        macd_now, signal_now, hist_now, macd_prev, hist_prev = macd_values(closes)
+        if macd_now > signal_now:
+            long_score += 12
+        else:
+            short_score += 12
+        if hist_now > hist_prev:
+            long_score += 8
+        else:
+            short_score += 8
+
+        # 3) RSI zone (weight 15)
+        rsi_series = rsi_list(closes)
+        rsi_now = rsi_series[-1] if rsi_series[-1] is not None else 50
+        if rsi_now < 35:
+            long_score += 15
+        elif rsi_now > 65:
+            short_score += 15
+        elif rsi_now < 50:
+            short_score += 5
+        else:
+            long_score += 5
+
+        # 4) Stochastic RSI momentum (weight 15)
+        srsi = stoch_rsi_val(closes)
+        if srsi < 20:
+            long_score += 15
+        elif srsi > 80:
+            short_score += 15
+
+        # 5) Bollinger Bands position (weight 15)
+        upper, mid, lower = bollinger(closes)
+        if price <= lower:
+            long_score += 15
+        elif price >= upper:
+            short_score += 15
+        elif price < mid:
+            short_score += 5
+        else:
+            long_score += 5
+
+        # 6) OBV volume trend confirmation (weight 15)
+        obv_diff = obv_trend(closes, volumes)
+        if obv_diff > 0:
+            long_score += 15
+        elif obv_diff < 0:
+            short_score += 15
+
+        if long_score < 65 and short_score < 65:
+            return None
+
+        direction = "LONG" if long_score >= short_score else "SHORT"
+        score = max(long_score, short_score)
+
+        # --- gate 2: higher timeframe (4h) trend must agree ---
+        higher_trend = htf_trend(symbol)
+        if higher_trend is not None and higher_trend != direction:
+            return None
+
+        # ATR-based dynamic SL/TP
+        atr = atr_val(highs, lows, closes)
+        if atr <= 0:
+            atr = price * 0.01
+
+        if direction == "LONG":
+            sl = price - 1.5 * atr
+            tp1 = price + 2.0 * atr
+            tp2 = price + 3.5 * atr
+        else:
+            sl = price + 1.5 * atr
+            tp1 = price - 2.0 * atr
+            tp2 = price - 3.5 * atr
+
+        # exact risk:reward from real distances (not approximated)
+        risk = abs(price - sl)
+        reward = abs(tp2 - price)
+        rr = round(reward / risk, 2) if risk > 0 else 0
+
+        # gate 3: don't send signals with a poor risk:reward
+        if rr < 1.5:
+            return None
+
+        return {
+            "symbol": symbol,
+            "dir": direction,
+            "score": min(score, 99),
+            "price": round(price, 6),
+            "sl": round(sl, 6),
+            "tp1": round(tp1, 6),
+            "tp2": round(tp2, 6),
+            "rr": rr,
+            "adx": round(adx, 1),
+        }
+
+    except Exception as e:
+        print(f"[SCORE ERROR] {symbol}: {e}")
         return None
-
-    direction = "LONG" if long_score >= short_score else "SHORT"
-    score = max(long_score, short_score)
-
-    # ATR-based dynamic SL/TP (more realistic than fixed %)
-    atr = atr_val(highs, lows, closes)
-    if atr == 0:
-        atr = price * 0.01
-
-    if direction == "LONG":
-        sl = price - 1.5 * atr
-        tp1 = price + 2.0 * atr
-        tp2 = price + 3.5 * atr
-    else:
-        sl = price + 1.5 * atr
-        tp1 = price - 2.0 * atr
-        tp2 = price - 3.5 * atr
-
-    return {
-        "symbol": symbol,
-        "dir": direction,
-        "score": min(score, 99),
-        "price": round(price, 6),
-        "sl": round(sl, 6),
-        "tp1": round(tp1, 6),
-        "tp2": round(tp2, 6),
-    }
 
 
 # ================= TELEGRAM =================
@@ -364,8 +480,6 @@ def fmt(s, rank):
         tp1_pct = round(((entry - tp1) / entry) * 100, 2)
         tp2_pct = round(((entry - tp2) / entry) * 100, 2)
 
-    rr = round(tp2_pct / sl_pct, 1) if sl_pct else 0
-
     now = datetime.now()
     trading_session = get_session(now.hour)
 
@@ -377,11 +491,12 @@ def fmt(s, rank):
 Symbol: {s['symbol']}
 
 🏆 Confidence: {confidence}%
+📊 ADX: {s['adx']}
 💰 Entry: {entry}
 🛑 SL: {sl}  (-{sl_pct}%)
 🎯 TP1: {tp1}  (+{tp1_pct}%)
 🎯 TP2: {tp2}  (+{tp2_pct}%)
-📐 R:R  1:{rr}
+📐 R:R  1:{s['rr']}
 {trading_session}
 
 ━━━━━━━━━━━━━━━━━━━━━
@@ -395,7 +510,7 @@ def run_scan():
 
     results = []
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=5) as executor:
         outputs = list(executor.map(score_symbol, SYMBOLS))
 
     for result in outputs:
@@ -419,7 +534,7 @@ def run_scan():
 
 def main():
 
-    print("ADVANCED SIGNAL BOT STARTED")
+    print("HIGH-ACCURACY SIGNAL BOT STARTED")
 
     while True:
         try:
@@ -434,3 +549,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
