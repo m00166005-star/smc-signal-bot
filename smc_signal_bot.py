@@ -11,12 +11,17 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 BASE = "https://api.kucoin.com"
 
-SYMBOLS = [
+# fallback list, used only if the dynamic top-50 fetch fails
+FALLBACK_SYMBOLS = [
     "BTC-USDT", "ETH-USDT", "BNB-USDT", "SOL-USDT", "XRP-USDT",
     "DOGE-USDT", "ADA-USDT", "TRX-USDT", "AVAX-USDT", "LINK-USDT",
     "DOT-USDT", "MATIC-USDT", "LTC-USDT", "BCH-USDT", "ATOM-USDT",
     "NEAR-USDT", "APT-USDT", "ETC-USDT", "UNI-USDT", "FIL-USDT"
 ]
+
+TOP_N = 50
+STABLE_BASES = {"USDC", "DAI", "TUSD", "BUSD", "USDD", "FDUSD", "USDP", "GUSD", "EURC", "PYUSD"}
+LEVERAGED_TAGS = ("3L", "3S", "5L", "5S", "2L", "2S")
 
 TF = "1hour"
 HTF = "4hour"
@@ -65,6 +70,48 @@ def candles(symbol, tf=TF, limit=220):
     except Exception as e:
         print(f"[DATA ERROR] {symbol} ({tf}): {e}")
         return [], [], [], []
+
+
+# ================= SYMBOL UNIVERSE =================
+
+def get_top_symbols(n=TOP_N, quote="USDT"):
+    """Fetch the top-N most-traded USDT pairs on KuCoin by 24h turnover.
+    Falls back to a static list if the API call fails."""
+    try:
+        r = session.get(f"{BASE}/api/v1/market/allTickers", timeout=10)
+        if r.status_code != 200:
+            return FALLBACK_SYMBOLS
+
+        tickers = r.json().get("data", {}).get("ticker", [])
+        candidates = []
+
+        for t in tickers:
+            sym = t.get("symbol", "")
+            if not sym.endswith(f"-{quote}"):
+                continue
+
+            base = sym.split("-")[0]
+
+            if base in STABLE_BASES:
+                continue
+            if any(tag in base for tag in LEVERAGED_TAGS):
+                continue
+
+            try:
+                vol_value = float(t.get("volValue") or 0)
+            except (TypeError, ValueError):
+                vol_value = 0
+
+            candidates.append((sym, vol_value))
+
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        top = [sym for sym, _ in candidates[:n]]
+
+        return top if top else FALLBACK_SYMBOLS
+
+    except Exception as e:
+        print("[SYMBOL FETCH ERROR]", e)
+        return FALLBACK_SYMBOLS
 
 
 # ================= INDICATORS =================
@@ -307,14 +354,14 @@ def score_symbol(symbol):
         closes, highs, lows, volumes = candles(symbol)
 
         if len(closes) < 60:
-            return None
+            return {"symbol": symbol, "signal": False, "reason": "insufficient_data"}
 
         price = closes[-1]
 
         # --- gate 1: trend strength (skip choppy/ranging markets) ---
         adx = adx_val(highs, lows, closes)
         if adx and adx < 18:
-            return None
+            return {"symbol": symbol, "signal": False, "reason": "low_adx", "adx": round(adx, 1)}
 
         long_score = 0
         short_score = 0
@@ -376,7 +423,10 @@ def score_symbol(symbol):
             short_score += 15
 
         if long_score < 65 and short_score < 65:
-            return None
+            return {
+                "symbol": symbol, "signal": False, "reason": "weak_confluence",
+                "long_score": long_score, "short_score": short_score
+            }
 
         direction = "LONG" if long_score >= short_score else "SHORT"
         score = max(long_score, short_score)
@@ -384,7 +434,10 @@ def score_symbol(symbol):
         # --- gate 2: higher timeframe (4h) trend must agree ---
         higher_trend = htf_trend(symbol)
         if higher_trend is not None and higher_trend != direction:
-            return None
+            return {
+                "symbol": symbol, "signal": False, "reason": "htf_disagree",
+                "score": score, "wanted": direction, "htf": higher_trend
+            }
 
         # ATR-based dynamic SL/TP
         atr = atr_val(highs, lows, closes)
@@ -407,10 +460,20 @@ def score_symbol(symbol):
 
         # gate 3: don't send signals with a poor risk:reward
         if rr < 1.5:
-            return None
+            return {
+                "symbol": symbol, "signal": False, "reason": "poor_rr",
+                "score": score, "rr": rr
+            }
+
+        # Heuristic confidence estimate that TP gets hit.
+        # NOTE: this is NOT a backtested statistical probability - it's a
+        # weighted estimate from signal strength (score) + trend strength (ADX).
+        # A real probability would require historical backtesting of this exact logic.
+        probability = min(88, round(40 + score * 0.5 + min(adx, 40) * 0.2))
 
         return {
             "symbol": symbol,
+            "signal": True,
             "dir": direction,
             "score": min(score, 99),
             "price": round(price, 6),
@@ -419,11 +482,12 @@ def score_symbol(symbol):
             "tp2": round(tp2, 6),
             "rr": rr,
             "adx": round(adx, 1),
+            "probability": probability,
         }
 
     except Exception as e:
         print(f"[SCORE ERROR] {symbol}: {e}")
-        return None
+        return {"symbol": symbol, "signal": False, "reason": "error", "detail": str(e)}
 
 
 # ================= TELEGRAM =================
@@ -492,6 +556,7 @@ Symbol: {s['symbol']}
 
 🏆 Confidence: {confidence}%
 📊 ADX: {s['adx']}
+🎲 Est. TP Probability: {s['probability']}%
 💰 Entry: {entry}
 🛑 SL: {sl}  (-{sl_pct}%)
 🎯 TP1: {tp1}  (+{tp1_pct}%)
@@ -508,14 +573,32 @@ Symbol: {s['symbol']}
 
 def run_scan():
 
-    results = []
+    symbols = get_top_symbols(TOP_N)
+    print(f"Scanning {len(symbols)} symbols...")
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        outputs = list(executor.map(score_symbol, SYMBOLS))
+    results = []
+    reason_counts = {}
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        outputs = list(executor.map(score_symbol, symbols))
 
     for result in outputs:
-        if result:
+        if not result:
+            reason_counts["no_result"] = reason_counts.get("no_result", 0) + 1
+            continue
+
+        if result.get("signal"):
             results.append(result)
+        else:
+            reason = result.get("reason", "unknown")
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+    # transparent per-scan breakdown, visible in the GitHub Actions log
+    print("---- SCAN BREAKDOWN ----")
+    print(f"Passed all filters (signals found): {len(results)}")
+    for reason, count in reason_counts.items():
+        print(f"Rejected [{reason}]: {count}")
+    print("------------------------")
 
     results.sort(key=lambda x: x["score"], reverse=True)
 
@@ -525,7 +608,13 @@ def run_scan():
         for rank, signal in enumerate(top_signals, start=1):
             send(fmt(signal, rank))
     else:
-        send(f"⚪ NO STRONG SIGNAL\n{datetime.now()}")
+        breakdown = ", ".join(f"{r}: {c}" for r, c in reason_counts.items())
+        send(
+            f"⚪ NO STRONG SIGNAL\n"
+            f"Scanned: {len(symbols)} coins\n"
+            f"Breakdown -> {breakdown}\n"
+            f"{datetime.now()}"
+        )
 
     send(f"SCAN DONE {datetime.now()}")
 
