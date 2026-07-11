@@ -172,16 +172,22 @@ def send(msg):
         print("[TELEGRAM ERROR]", e)
 
 
+def get_session(hour_utc):
+    if 0 <= hour_utc < 8:
+        return "🗼 Asia (Tokyo/Sydney)"
+    elif 8 <= hour_utc < 13:
+        return "🎡 London"
+    elif 13 <= hour_utc < 17:
+        return "🌉 London-NY Overlap"
+    else:
+        return "🗽 New York"
+
+
 def fmt(s, rank):
 
-    medal = {
-        1: "🥇",
-        2: "🥈",
-        3: "🥉"
-    }.get(rank, "🏅")
-
     direction_emoji = "📈" if s["dir"] == "LONG" else "📉"
-    side = "LONG 🟢" if s["dir"] == "LONG" else "SHORT 🔴"
+    side_word = "LONG" if s["dir"] == "LONG" else "SELL"
+    side_mark = "🟢🟢" if s["dir"] == "LONG" else "🔴🔴"
 
     confidence = min(s["score"], 99)
 
@@ -202,19 +208,26 @@ def fmt(s, rank):
 
     rr = round(tp2_pct / sl_pct, 1) if sl_pct else 0
 
+    now = datetime.now()
+    session = get_session(now.hour)
+
     return f"""
-{medal} {direction_emoji}  NEW SIGNAL  ·  {confidence}% Confidence
-┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
-  🪙  {s['symbol']}
-  📊  {side}
-  ⏰  LIVE MARKET 🌍
-┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
-  💰  Entry    {entry}
-  🛑  SL       {sl}  (-{sl_pct}%)
-  🎯  TP1      {tp1}  (+{tp1_pct}%)
-  🎯  TP2      {tp2}  (+{tp2_pct}%)
-  📐  R : R    1 : {rr}
-┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
+
+🦁 PRO SIGNAL
+
+{side_mark} {side_word} {direction_emoji}
+Symbol: {s['symbol']}
+
+🏆 Confidence: {confidence}%
+💰 Entry: {entry}
+🛑 SL: {sl}  (-{sl_pct}%)
+🎯 TP1: {tp1}  (+{tp1_pct}%)
+🎯 TP2: {tp2}  (+{tp2_pct}%)
+📐 R:R  1:{rr}
+{session}
+
+━━━━━━━━━━━━━━━━━━━━━
+
 """
 def run_scan():
 
