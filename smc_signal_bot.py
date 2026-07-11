@@ -23,6 +23,8 @@ session = requests.Session()
 # ================= DATA =================
 
 def candles(symbol):
+    """Fetch OHLCV candles from KuCoin. Returns closes, highs, lows, volumes
+    (all in chronological order, oldest -> newest)."""
     try:
         r = session.get(
             f"{BASE}/api/v1/market/candles",
@@ -31,122 +33,280 @@ def candles(symbol):
         )
 
         if r.status_code != 200:
-            return []
+            return [], [], [], []
 
         data = r.json().get("data", [])
 
         if not data:
-            return []
+            return [], [], [], []
 
-        return [float(x[2]) for x in reversed(data[:100])]
+        # KuCoin format: [time, open, close, high, low, volume, turnover]
+        # newest first -> take up to 220 candles then reverse to chronological
+        chunk = list(reversed(data[:220]))
+
+        closes = [float(x[2]) for x in chunk]
+        highs = [float(x[3]) for x in chunk]
+        lows = [float(x[4]) for x in chunk]
+        volumes = [float(x[5]) for x in chunk]
+
+        return closes, highs, lows, volumes
 
     except Exception as e:
         print(f"[DATA ERROR] {symbol}: {e}")
-        return []
+        return [], [], [], []
 
 
 # ================= INDICATORS =================
 
-def ema(data, p):
-    if len(data) < p:
+def ema_val(data, period):
+    if len(data) < period:
         return data[-1] if data else 0
 
-    k = 2 / (p + 1)
-    e = sum(data[:p]) / p
+    k = 2 / (period + 1)
+    e = sum(data[:period]) / period
 
-    for v in data[p:]:
+    for v in data[period:]:
         e = v * k + e * (1 - k)
 
     return e
 
 
-def rsi(data):
-    if len(data) < 20:
-        return 50
+def ema_list(data, period):
+    """Full EMA series aligned to data, None where not enough history yet."""
+    if len(data) < period:
+        return [None] * len(data)
 
-    gain = 0
-    loss = 0
+    k = 2 / (period + 1)
+    result = [None] * (period - 1)
+    e = sum(data[:period]) / period
+    result.append(e)
 
-    for i in range(-14, -1):
+    for v in data[period:]:
+        e = v * k + e * (1 - k)
+        result.append(e)
+
+    return result
+
+
+def rsi_list(data, period=14):
+    if len(data) < period + 1:
+        return [None] * len(data)
+
+    gains = [0.0] * len(data)
+    losses = [0.0] * len(data)
+
+    for i in range(1, len(data)):
         diff = data[i] - data[i - 1]
+        gains[i] = max(diff, 0)
+        losses[i] = max(-diff, 0)
 
-        if diff > 0:
-            gain += diff
-        else:
-            loss -= diff
+    rsis = [None] * len(data)
+    avg_gain = sum(gains[1:period + 1]) / period
+    avg_loss = sum(losses[1:period + 1]) / period
 
-    if loss == 0:
-        return 100
+    def to_rsi(ag, al):
+        if al == 0:
+            return 100.0
+        rs = ag / al
+        return 100 - (100 / (1 + rs))
 
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
+    rsis[period] = to_rsi(avg_gain, avg_loss)
+
+    for i in range(period + 1, len(data)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        rsis[i] = to_rsi(avg_gain, avg_loss)
+
+    return rsis
 
 
-def volatility(data):
-    if len(data) < 15:
+def macd_values(data, fast=12, slow=26, signal_p=9):
+    ema_fast = ema_list(data, fast)
+    ema_slow = ema_list(data, slow)
+
+    macd_line = []
+    for f, s in zip(ema_fast, ema_slow):
+        macd_line.append(None if (f is None or s is None) else f - s)
+
+    valid = [v for v in macd_line if v is not None]
+    if len(valid) < signal_p + 1:
+        return 0, 0, 0, 0, 0
+
+    signal_series = ema_list(valid, signal_p)
+
+    macd_now = valid[-1]
+    macd_prev = valid[-2]
+    signal_now = signal_series[-1] if signal_series[-1] is not None else macd_now
+    signal_prev = signal_series[-2] if len(signal_series) >= 2 and signal_series[-2] is not None else signal_now
+
+    hist_now = macd_now - signal_now
+    hist_prev = macd_prev - signal_prev
+
+    return macd_now, signal_now, hist_now, macd_prev, hist_prev
+
+
+def stoch_rsi_val(data, rsi_period=14, stoch_period=14):
+    rsis = rsi_list(data, rsi_period)
+    valid = [v for v in rsis if v is not None]
+
+    if len(valid) < stoch_period:
+        return 50.0
+
+    window = valid[-stoch_period:]
+    lo, hi = min(window), max(window)
+
+    if hi == lo:
+        return 50.0
+
+    return (valid[-1] - lo) / (hi - lo) * 100
+
+
+def bollinger(data, period=20, mult=2):
+    if len(data) < period:
+        price = data[-1] if data else 0
+        return price, price, price
+
+    window = data[-period:]
+    mean = sum(window) / period
+    variance = sum((x - mean) ** 2 for x in window) / period
+    std = variance ** 0.5
+
+    return mean + mult * std, mean, mean - mult * std
+
+
+def obv_trend(closes, volumes, lookback=10):
+    if len(closes) < lookback + 1:
         return 0
 
-    return max(data[-15:]) - min(data[-15:])
+    obv = 0.0
+    series = [0.0]
+    for i in range(1, len(closes)):
+        if closes[i] > closes[i - 1]:
+            obv += volumes[i]
+        elif closes[i] < closes[i - 1]:
+            obv -= volumes[i]
+        series.append(obv)
+
+    recent = series[-lookback:]
+    return recent[-1] - recent[0]
+
+
+def atr_val(highs, lows, closes, period=14):
+    if len(closes) < 2:
+        return 0
+
+    trs = []
+    for i in range(1, len(closes)):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1])
+        )
+        trs.append(tr)
+
+    if len(trs) < period:
+        return sum(trs) / len(trs) if trs else 0
+
+    return sum(trs[-period:]) / period
 
 
 # ================= SCORING =================
 
 def score_symbol(symbol):
 
-    prices = candles(symbol)
+    closes, highs, lows, volumes = candles(symbol)
 
-    if len(prices) < 20:
+    if len(closes) < 60:
         return None
 
-    price = prices[-1]
-
-    e50 = ema(prices, 50)
-    e200 = ema(prices, 200)
-
-    r = rsi(prices)
-    vol = volatility(prices)
+    price = closes[-1]
 
     long_score = 0
     short_score = 0
 
+    # 1) Trend filter - EMA50 vs EMA200 (weight 20)
+    e50 = ema_val(closes, 50)
+    e200 = ema_val(closes, min(200, len(closes) - 1))
     if e50 > e200:
-        long_score += 40
+        long_score += 20
     else:
-        short_score += 40
+        short_score += 20
 
-    if r < 40:
-        long_score += 25
-    elif r > 60:
-        short_score += 25
+    # 2) MACD crossover + histogram momentum (weight 20)
+    macd_now, signal_now, hist_now, macd_prev, hist_prev = macd_values(closes)
+    if macd_now > signal_now:
+        long_score += 12
+    else:
+        short_score += 12
+    if hist_now > hist_prev:
+        long_score += 8
+    else:
+        short_score += 8
 
-    if vol > price * 0.012:
+    # 3) RSI zone (weight 15)
+    rsi_now = rsi_list(closes)[-1] or 50
+    if rsi_now < 35:
         long_score += 15
+    elif rsi_now > 65:
+        short_score += 15
+    elif rsi_now < 50:
+        short_score += 5
+    else:
+        long_score += 5
+
+    # 4) Stochastic RSI momentum (weight 15)
+    srsi = stoch_rsi_val(closes)
+    if srsi < 20:
+        long_score += 15
+    elif srsi > 80:
         short_score += 15
 
-    if prices[-1] > prices[-2]:
-        long_score += 10
+    # 5) Bollinger Bands position (weight 15)
+    upper, mid, lower = bollinger(closes)
+    if price <= lower:
+        long_score += 15
+    elif price >= upper:
+        short_score += 15
+    elif price < mid:
+        short_score += 5
     else:
-        short_score += 10
+        long_score += 5
 
-    if long_score < 55 and short_score < 55:
+    # 6) OBV volume trend confirmation (weight 15)
+    obv_diff = obv_trend(closes, volumes)
+    if obv_diff > 0:
+        long_score += 15
+    elif obv_diff < 0:
+        short_score += 15
+
+    if long_score < 65 and short_score < 65:
         return None
 
     direction = "LONG" if long_score >= short_score else "SHORT"
     score = max(long_score, short_score)
 
+    # ATR-based dynamic SL/TP (more realistic than fixed %)
+    atr = atr_val(highs, lows, closes)
+    if atr == 0:
+        atr = price * 0.01
+
+    if direction == "LONG":
+        sl = price - 1.5 * atr
+        tp1 = price + 2.0 * atr
+        tp2 = price + 3.5 * atr
+    else:
+        sl = price + 1.5 * atr
+        tp1 = price - 2.0 * atr
+        tp2 = price - 3.5 * atr
+
     return {
         "symbol": symbol,
         "dir": direction,
-        "score": score,
+        "score": min(score, 99),
         "price": round(price, 6),
-        "sl": round(
-            price * (0.98 if direction == "LONG" else 1.02),
-            6
-        ),
-        "tp": round(
-            price * (1.03 if direction == "LONG" else 0.97),
-            6
-        )
+        "sl": round(sl, 6),
+        "tp1": round(tp1, 6),
+        "tp2": round(tp2, 6),
     }
 
 
@@ -189,19 +349,17 @@ def fmt(s, rank):
     side_word = "LONG" if s["dir"] == "LONG" else "SELL"
     side_mark = "🟢🟢" if s["dir"] == "LONG" else "🔴🔴"
 
-    confidence = min(s["score"], 99)
-
+    confidence = s["score"]
     entry = s["price"]
     sl = s["sl"]
-    tp1 = s["tp"]
+    tp1 = s["tp1"]
+    tp2 = s["tp2"]
 
     if s["dir"] == "LONG":
-        tp2 = round(entry * 1.05, 6)
         sl_pct = round(((entry - sl) / entry) * 100, 2)
         tp1_pct = round(((tp1 - entry) / entry) * 100, 2)
         tp2_pct = round(((tp2 - entry) / entry) * 100, 2)
     else:
-        tp2 = round(entry * 0.95, 6)
         sl_pct = round(((sl - entry) / entry) * 100, 2)
         tp1_pct = round(((entry - tp1) / entry) * 100, 2)
         tp2_pct = round(((entry - tp2) / entry) * 100, 2)
@@ -209,7 +367,7 @@ def fmt(s, rank):
     rr = round(tp2_pct / sl_pct, 1) if sl_pct else 0
 
     now = datetime.now()
-    session = get_session(now.hour)
+    trading_session = get_session(now.hour)
 
     return f"""
 
@@ -224,11 +382,15 @@ Symbol: {s['symbol']}
 🎯 TP1: {tp1}  (+{tp1_pct}%)
 🎯 TP2: {tp2}  (+{tp2_pct}%)
 📐 R:R  1:{rr}
-{session}
+{trading_session}
 
 ━━━━━━━━━━━━━━━━━━━━━
 
 """
+
+
+# ================= SCAN =================
+
 def run_scan():
 
     results = []
@@ -240,42 +402,29 @@ def run_scan():
         if result:
             results.append(result)
 
-    results.sort(
-        key=lambda x: x["score"],
-        reverse=True
-    )
+    results.sort(key=lambda x: x["score"], reverse=True)
 
     top_signals = results[:2]
 
     if top_signals:
-
-        for signal in top_signals:
-            send(fmt(signal))
-
+        for rank, signal in enumerate(top_signals, start=1):
+            send(fmt(signal, rank))
     else:
-        send(
-            f"⚪ NO STRONG SIGNAL\n{datetime.now()}"
-        )
+        send(f"⚪ NO STRONG SIGNAL\n{datetime.now()}")
 
-    send(
-        f"SCAN DONE {datetime.now()}"
-    )
+    send(f"SCAN DONE {datetime.now()}")
 
 
 # ================= MAIN =================
 
 def main():
 
-    print("AUTO 30M BOT STARTED")
+    print("ADVANCED SIGNAL BOT STARTED")
 
     while True:
-
         try:
-
             run_scan()
-
         except Exception as e:
-
             print("[BOT ERROR]", e)
 
         time.sleep(1800)
