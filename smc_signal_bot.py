@@ -9,22 +9,22 @@ from urllib3.util.retry import Retry
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-BASE = "https://api.kucoin.com"
+BASE = "https://api.toobit.com"
 
-# fallback list, used only if the dynamic top-50 fetch fails
-FALLBACK_SYMBOLS = [
-    "BTC-USDT", "ETH-USDT", "BNB-USDT", "SOL-USDT", "XRP-USDT",
-    "DOGE-USDT", "ADA-USDT", "TRX-USDT", "AVAX-USDT", "LINK-USDT",
-    "DOT-USDT", "MATIC-USDT", "LTC-USDT", "BCH-USDT", "ATOM-USDT",
-    "NEAR-USDT", "APT-USDT", "ETC-USDT", "UNI-USDT", "FIL-USDT"
+# fixed watchlist - only these symbols get analyzed (exactly what you showed me)
+SYMBOLS = [
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
+    "DOGEUSDT", "ADAUSDT", "LTCUSDT", "LINKUSDT", "AVAXUSDT",
+    "THETAUSDT", "SANDUSDT", "TURBOUSDT", "NOTUSDT", "ENAUSDT",
+    "AAVEUSDT", "WIFUSDT", "SUIUSDT", "1000SHIBUSDT", "1000PEPEUSDT",
+    "CRVUSDT", "CRCLUSDT", "MSTRUSDT", "XBRUSDT",
+    "NVDAUSDT", "TSLAUSDT", "HOODUSDT", "LLYUSDT", "AAPLUSDT",
+    "GOOGLUSDT", "AMZNUSDT", "APPUSDT", "MSFTUSDT",
+    "XAUUSDT", "XAGUSDT", "XTIUSDT", "PAXGUSDT", "NAS100USDT",
 ]
 
-TOP_N = 50
-STABLE_BASES = {"USDC", "DAI", "TUSD", "BUSD", "USDD", "FDUSD", "USDP", "GUSD", "EURC", "PYUSD"}
-LEVERAGED_TAGS = ("3L", "3S", "5L", "5S", "2L", "2S")
-
-TF = "1hour"
-HTF = "4hour"
+TF = "1h"
+HTF = "4h"
 
 # resilient HTTP session: automatic retry on timeouts / rate limits / 5xx
 session = requests.Session()
@@ -40,78 +40,40 @@ session.mount("https://", HTTPAdapter(max_retries=retry_strategy))
 # ================= DATA =================
 
 def candles(symbol, tf=TF, limit=220):
-    """Fetch OHLCV candles from KuCoin. Returns closes, highs, lows, volumes
-    (chronological order, oldest -> newest)."""
+    """Fetch OHLCV candles from Toobit. Returns closes, highs, lows, volumes
+    (chronological order, oldest -> newest).
+
+    NOTE: symbol format / interval strings are based on Toobit's public docs
+    (api-docs.toobit.com). If this returns empty on your first run, check the
+    Actions log for [DATA ERROR] lines and send them to me - the exact symbol
+    format for stock/commodity tickers may need a small tweak."""
     try:
         r = session.get(
-            f"{BASE}/api/v1/market/candles",
-            params={"symbol": symbol, "type": tf},
+            f"{BASE}/quote/v1/klines",
+            params={"symbol": symbol, "interval": tf, "limit": limit},
             timeout=10
         )
 
         if r.status_code != 200:
+            print(f"[DATA ERROR] {symbol} ({tf}): HTTP {r.status_code} - {r.text[:200]}")
             return [], [], [], []
 
-        data = r.json().get("data", [])
+        data = r.json()
 
-        if not data:
+        if not data or not isinstance(data, list):
             return [], [], [], []
 
-        # KuCoin format: [time, open, close, high, low, volume, turnover]
-        chunk = list(reversed(data[:limit]))
-
-        closes = [float(x[2]) for x in chunk]
-        highs = [float(x[3]) for x in chunk]
-        lows = [float(x[4]) for x in chunk]
-        volumes = [float(x[5]) for x in chunk]
+        # Toobit format: [openTime, open, high, low, close, volume, closeTime, ...]
+        closes = [float(x[4]) for x in data]
+        highs = [float(x[2]) for x in data]
+        lows = [float(x[3]) for x in data]
+        volumes = [float(x[5]) for x in data]
 
         return closes, highs, lows, volumes
 
     except Exception as e:
         print(f"[DATA ERROR] {symbol} ({tf}): {e}")
         return [], [], [], []
-
-
-# ================= SYMBOL UNIVERSE =================
-
-def get_top_symbols(n=TOP_N, quote="USDT"):
-    """Fetch the top-N most-traded USDT pairs on KuCoin by 24h turnover.
-    Falls back to a static list if the API call fails."""
-    try:
-        r = session.get(f"{BASE}/api/v1/market/allTickers", timeout=10)
-        if r.status_code != 200:
-            return FALLBACK_SYMBOLS
-
-        tickers = r.json().get("data", {}).get("ticker", [])
-        candidates = []
-
-        for t in tickers:
-            sym = t.get("symbol", "")
-            if not sym.endswith(f"-{quote}"):
-                continue
-
-            base = sym.split("-")[0]
-
-            if base in STABLE_BASES:
-                continue
-            if any(tag in base for tag in LEVERAGED_TAGS):
-                continue
-
-            try:
-                vol_value = float(t.get("volValue") or 0)
-            except (TypeError, ValueError):
-                vol_value = 0
-
-            candidates.append((sym, vol_value))
-
-        candidates.sort(key=lambda x: x[1], reverse=True)
-        top = [sym for sym, _ in candidates[:n]]
-
-        return top if top else FALLBACK_SYMBOLS
-
-    except Exception as e:
-        print("[SYMBOL FETCH ERROR]", e)
-        return FALLBACK_SYMBOLS
 
 
 # ================= INDICATORS =================
@@ -468,7 +430,6 @@ def score_symbol(symbol):
         # Heuristic confidence estimate that TP gets hit.
         # NOTE: this is NOT a backtested statistical probability - it's a
         # weighted estimate from signal strength (score) + trend strength (ADX).
-        # A real probability would require historical backtesting of this exact logic.
         probability = min(88, round(40 + score * 0.5 + min(adx, 40) * 0.2))
 
         return {
@@ -547,7 +508,7 @@ def fmt(s, rank):
     now = datetime.now()
     trading_session = get_session(now.hour)
 
-    return f"""
+    return f"""👆
 
 🦁 PRO SIGNAL
 
@@ -573,14 +534,13 @@ Symbol: {s['symbol']}
 
 def run_scan():
 
-    symbols = get_top_symbols(TOP_N)
-    print(f"Scanning {len(symbols)} symbols...")
+    print(f"Scanning {len(SYMBOLS)} symbols...")
 
     results = []
     reason_counts = {}
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        outputs = list(executor.map(score_symbol, symbols))
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        outputs = list(executor.map(score_symbol, SYMBOLS))
 
     for result in outputs:
         if not result:
@@ -593,7 +553,6 @@ def run_scan():
             reason = result.get("reason", "unknown")
             reason_counts[reason] = reason_counts.get(reason, 0) + 1
 
-    # transparent per-scan breakdown, visible in the GitHub Actions log
     print("---- SCAN BREAKDOWN ----")
     print(f"Passed all filters (signals found): {len(results)}")
     for reason, count in reason_counts.items():
@@ -611,7 +570,7 @@ def run_scan():
         breakdown = ", ".join(f"{r}: {c}" for r, c in reason_counts.items())
         send(
             f"⚪ NO STRONG SIGNAL\n"
-            f"Scanned: {len(symbols)} coins\n"
+            f"Scanned: {len(SYMBOLS)} symbols\n"
             f"Breakdown -> {breakdown}\n"
             f"{datetime.now()}"
         )
@@ -623,7 +582,7 @@ def run_scan():
 
 def main():
 
-    print("HIGH-ACCURACY SIGNAL BOT STARTED")
+    print("WATCHLIST SIGNAL BOT STARTED")
 
     while True:
         try:
@@ -631,7 +590,7 @@ def main():
         except Exception as e:
             print("[BOT ERROR]", e)
 
-        time.sleep(1800)
+        time.sleep(7200)  # every 2 hours
 
 
 # ================= START =================
