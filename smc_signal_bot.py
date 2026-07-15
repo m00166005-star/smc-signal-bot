@@ -12,28 +12,29 @@ TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 SHEETS_URL = os.environ.get("SHEETS_WEBAPP_URL")
 SHEETS_SECRET = os.environ.get("SHEETS_SECRET")
-CHART_IMG_KEY = os.environ.get("CHART_IMG_KEY")  # optional - from chart-img.com
 
-BASE = "https://api.toobit.com"
+BASE = "https://api.kucoin.com"
 
 FALLBACK_SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
-    "DOGEUSDT", "ADAUSDT", "LTCUSDT", "LINKUSDT", "AVAXUSDT",
+    "BTC-USDT", "ETH-USDT", "BNB-USDT", "SOL-USDT", "XRP-USDT",
+    "DOGE-USDT", "ADA-USDT", "LTC-USDT", "LINK-USDT", "AVAX-USDT",
 ]
 
-TOP_N = 50
+TOP_N = 60
 STABLE_SYMBOLS = {"usdt", "usdc", "dai", "tusd", "busd", "usdd", "fdusd", "usdp", "gusd", "eurc", "pyusd"}
 
-TF = "1h"
-HTF = "4h"
-LTF = "15m"
+TF = "1hour"
+HTF = "4hour"
+LTF = "15min"
 
 IRAN_OFFSET = timedelta(hours=3, minutes=30)
+MIN_SCORE = 85
+KILL_SWITCH_LOSSES = 4
+KILL_SWITCH_COOLDOWN_HOURS = 12
 
 session = requests.Session()
 retry_strategy = Retry(
-    total=3,
-    backoff_factor=0.6,
+    total=3, backoff_factor=0.6,
     status_forcelist=[429, 500, 502, 503, 504],
     allowed_methods=["GET"]
 )
@@ -44,13 +45,12 @@ def iran_now():
     return datetime.utcnow() + IRAN_OFFSET
 
 
-# ================= SYMBOL UNIVERSE (top 50 by market cap, via CoinGecko) =================
+# ================= SYMBOL UNIVERSE (top 60 by market cap, CoinGecko) =================
 
 def get_top_symbols(n=TOP_N):
-    """Top-N coins by market cap (CoinGecko, free/no key) mapped to Toobit-style
-    'XXXUSDT' tickers. Stablecoins excluded. NOTE: CoinGecko's ticker symbol
-    doesn't always exactly match the exchange's symbol - if a coin fails to
-    fetch candles it will just get skipped (see [DATA ERROR] logs)."""
+    """CoinGecko is free/no-key. Maps to KuCoin's 'XXX-USDT' ticker format.
+    Some coins may not exist on KuCoin - those just get skipped with a
+    [DATA ERROR] log line, they don't break the scan."""
     try:
         r = session.get(
             "https://api.coingecko.com/api/v3/coins/markets",
@@ -61,16 +61,14 @@ def get_top_symbols(n=TOP_N):
             print(f"[SYMBOL FETCH ERROR] HTTP {r.status_code}")
             return FALLBACK_SYMBOLS
 
-        data = r.json()
         symbols = []
-        for coin in data:
+        for coin in r.json():
             sym = (coin.get("symbol") or "").lower()
             if not sym or sym in STABLE_SYMBOLS:
                 continue
-            symbols.append(sym.upper() + "USDT")
+            symbols.append(sym.upper() + "-USDT")
             if len(symbols) >= n:
                 break
-
         return symbols if symbols else FALLBACK_SYMBOLS
 
     except Exception as e:
@@ -78,29 +76,30 @@ def get_top_symbols(n=TOP_N):
         return FALLBACK_SYMBOLS
 
 
-# ================= CANDLE DATA (Toobit) =================
+# ================= CANDLE DATA (KuCoin) =================
 
 def candles(symbol, tf=TF, limit=220):
     """Returns closes, highs, lows, volumes (chronological, oldest -> newest)."""
     try:
         r = session.get(
-            f"{BASE}/quote/v1/klines",
-            params={"symbol": symbol, "interval": tf, "limit": limit},
+            f"{BASE}/api/v1/market/candles",
+            params={"symbol": symbol, "type": tf},
             timeout=10
         )
         if r.status_code != 200:
             print(f"[DATA ERROR] {symbol} ({tf}): HTTP {r.status_code} - {r.text[:150]}")
             return [], [], [], []
 
-        data = r.json()
-        if not data or not isinstance(data, list):
+        data = r.json().get("data", [])
+        if not data:
             return [], [], [], []
 
-        # Toobit kline format: [openTime, open, high, low, close, volume, closeTime, ...]
-        closes = [float(x[4]) for x in data]
-        highs = [float(x[2]) for x in data]
-        lows = [float(x[3]) for x in data]
-        volumes = [float(x[5]) for x in data]
+        # KuCoin kline format: [time, open, close, high, low, volume, turnover]
+        chunk = list(reversed(data[:limit]))
+        closes = [float(x[2]) for x in chunk]
+        highs = [float(x[3]) for x in chunk]
+        lows = [float(x[4]) for x in chunk]
+        volumes = [float(x[5]) for x in chunk]
         return closes, highs, lows, volumes
 
     except Exception as e:
@@ -214,8 +213,7 @@ def atr_val(highs, lows, closes, period=14):
         return 0
     trs = []
     for i in range(1, len(closes)):
-        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
-        trs.append(tr)
+        trs.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
     if len(trs) < period:
         return sum(trs) / len(trs) if trs else 0
     return sum(trs[-period:]) / period
@@ -264,11 +262,7 @@ def adx_val(highs, lows, closes, period=14):
     return sum(dx_values[-period:]) / period
 
 
-# ================= RSI DIVERGENCE =================
-
 def rsi_divergence(closes, rsis, direction, lookback=30):
-    """Simplified divergence check: compares the price extreme + RSI value in
-    the first half vs second half of the lookback window."""
     n = len(closes)
     start = max(2, n - lookback)
     sub_c = closes[start:]
@@ -276,28 +270,28 @@ def rsi_divergence(closes, rsis, direction, lookback=30):
     half = len(sub_c) // 2
     if half < 3:
         return False
-
     if direction == "LONG":
-        low1 = min(sub_c[:half])
-        low2 = min(sub_c[half:])
+        low1, low2 = min(sub_c[:half]), min(sub_c[half:])
         i1 = sub_c[:half].index(low1)
         i2 = half + sub_c[half:].index(low2)
         r1, r2 = sub_r[i1], sub_r[i2]
         if r1 is None or r2 is None:
             return False
-        return low2 < low1 and r2 > r1  # bullish divergence
+        return low2 < low1 and r2 > r1
     else:
-        high1 = max(sub_c[:half])
-        high2 = max(sub_c[half:])
+        high1, high2 = max(sub_c[:half]), max(sub_c[half:])
         i1 = sub_c[:half].index(high1)
         i2 = half + sub_c[half:].index(high2)
         r1, r2 = sub_r[i1], sub_r[i2]
         if r1 is None or r2 is None:
             return False
-        return high2 > high1 and r2 < r1  # bearish divergence
+        return high2 > high1 and r2 < r1
 
 
-# ================= ICT: STRUCTURE (BOS / CHOCH) + FVG =================
+# ================= ICT: STRUCTURE, ZONES, BLOCKS =================
+# NOTE: these are practical approximations of ICT concepts computed purely
+# from OHLCV candles (no paid data needed). True institutional order-flow
+# detection would need order-book/tape data we don't have access to here.
 
 def find_swings(highs, lows, arm=2):
     swing_highs, swing_lows = [], []
@@ -314,7 +308,6 @@ def detect_structure(highs, lows, closes):
     swing_highs, swing_lows = find_swings(highs, lows)
     if len(swing_highs) < 2 or len(swing_lows) < 2:
         return None
-
     last_price = closes[-1]
     last_sh, prev_sh = swing_highs[-1][1], swing_highs[-2][1]
     last_sl, prev_sl = swing_lows[-1][1], swing_lows[-2][1]
@@ -331,7 +324,6 @@ def detect_structure(highs, lows, closes):
 
 
 def detect_fvg_zones(highs, lows, closes, lookback=40):
-    """Classic 3-candle Fair Value Gap detection."""
     zones = []
     n = len(closes)
     start = max(2, n - lookback)
@@ -348,8 +340,8 @@ def price_in_fvg(price, zones, direction):
     return any(typ == want and lo <= price <= hi for lo, hi, typ in zones)
 
 
-def near_session_liquidity(price, highs, lows, lookback=8, tolerance=0.003):
-    """Proxy for session high/low liquidity zones using the recent candle range."""
+def near_key_level(price, highs, lows, lookback=8, tolerance=0.003):
+    """Session/swing high-low proxy for 'key levels' + liquidity zones."""
     if len(highs) < lookback:
         return False
     session_high = max(highs[-lookback:])
@@ -357,7 +349,68 @@ def near_session_liquidity(price, highs, lows, lookback=8, tolerance=0.003):
     return (abs(price - session_high) / price <= tolerance) or (abs(price - session_low) / price <= tolerance)
 
 
-# ================= VOLUME PROFILE (POC) =================
+def find_order_block(highs, lows, closes, direction, lookback=40, impulse_mult=1.8):
+    """Simplified Order Block: last opposite-colored candle before a strong
+    impulsive move. Uses close-over-close as a proxy for candle color since
+    we don't fetch open prices (true OB detection normally uses open vs close)."""
+    n = len(closes)
+    start = max(3, n - lookback)
+    avg_atr = atr_val(highs, lows, closes)
+    if avg_atr <= 0:
+        return None
+    for i in range(n - 2, start, -1):
+        move = closes[i + 1] - closes[i]
+        if direction == "LONG" and move > impulse_mult * avg_atr and closes[i] < closes[i - 1]:
+            return (lows[i], highs[i])
+        if direction == "SHORT" and move < -impulse_mult * avg_atr and closes[i] > closes[i - 1]:
+            return (lows[i], highs[i])
+    return None
+
+
+def price_in_zone(price, zone):
+    if not zone:
+        return False
+    lo, hi = zone
+    return lo <= price <= hi
+
+
+def detect_liquidity_sweep(highs, lows, closes, direction, lookback=20):
+    """Latest candle sweeps beyond a recent swing high/low and closes back
+    inside range - classic stop-hunt / liquidity grab."""
+    if len(highs) < lookback + 2:
+        return False
+    prior_highs = highs[-lookback - 1:-1]
+    prior_lows = lows[-lookback - 1:-1]
+    last_high, last_low, last_close = highs[-1], lows[-1], closes[-1]
+    if direction == "LONG":
+        return last_low < min(prior_lows) and last_close > min(prior_lows)
+    else:
+        return last_high > max(prior_highs) and last_close < max(prior_highs)
+
+
+def detect_structure_retest(highs, lows, closes, direction, tolerance=0.004):
+    """Combined Breaker Block / Mitigation Block proxy: price retesting the
+    most recent broken swing level. (These two ICT concepts are merged into
+    one practical check here - reliably telling them apart needs more
+    granular block classification than is safe to automate.)"""
+    swing_highs, swing_lows = find_swings(highs, lows)
+    if not swing_highs or not swing_lows:
+        return False
+    price = closes[-1]
+    level = swing_highs[-1][1] if direction == "LONG" else swing_lows[-1][1]
+    return abs(price - level) / price <= tolerance
+
+
+def premium_discount_ok(highs, lows, price, direction, lookback=30):
+    lb = min(lookback, len(highs))
+    if lb < 5:
+        return False
+    hi, lo = max(highs[-lb:]), min(lows[-lb:])
+    if hi == lo:
+        return False
+    mid = (hi + lo) / 2
+    return price < mid if direction == "LONG" else price > mid
+
 
 def volume_poc(closes, volumes, bins=20):
     if not closes:
@@ -374,39 +427,6 @@ def volume_poc(closes, volumes, bins=20):
     return lo + (max_idx + 0.5) * bin_size
 
 
-# ================= FUNDING RATE (best-effort; endpoint unverified) =================
-
-def funding_rate(symbol):
-    """NOTE: exact Toobit funding-rate endpoint/response shape isn't verified
-    in this environment. If this 404s or the fields don't match, check the
-    [FUNDING ERROR] log line and send it over - easy to patch."""
-    try:
-        r = session.get(f"{BASE}/quote/v1/funding/rate", params={"symbol": symbol}, timeout=8)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        rate = data.get("rate") or data.get("fundingRate")
-        if rate is None and isinstance(data.get("data"), dict):
-            rate = data["data"].get("rate")
-        return float(rate) if rate is not None else None
-    except Exception as e:
-        print(f"[FUNDING ERROR] {symbol}: {e}")
-        return None
-
-
-def funding_agree(symbol, direction):
-    rate = funding_rate(symbol)
-    if rate is None:
-        return False
-    if direction == "SHORT" and rate > 0.0005:
-        return True
-    if direction == "LONG" and rate < -0.0005:
-        return True
-    return False
-
-
-# ================= FEAR & GREED INDEX =================
-
 def fear_greed():
     try:
         r = session.get("https://api.alternative.me/fng/", timeout=8)
@@ -420,15 +440,13 @@ def fear_greed():
 
 def fear_greed_ok(direction, fng):
     if fng is None:
-        return True  # don't block on failure
+        return True
     if direction == "LONG" and fng >= 85:
         return False
     if direction == "SHORT" and fng <= 15:
         return False
     return True
 
-
-# ================= LOWER TIMEFRAME CONFLICT =================
 
 def lower_tf_conflict(symbol, direction):
     closes, highs, lows, _ = candles(symbol, tf=LTF, limit=30)
@@ -456,7 +474,15 @@ def htf_trend(symbol):
     return "LONG" if e50 > e200 else "SHORT"
 
 
-# ================= SCORING: 5-STAGE CONFIRMATION =================
+# ================= WEIGHTED SCORING (0-100, min 85 to signal) =================
+
+def grade_for(score):
+    if score >= 95:
+        return "A+"
+    if score >= 90:
+        return "A"
+    return "B"
+
 
 def score_symbol(symbol):
     try:
@@ -466,57 +492,15 @@ def score_symbol(symbol):
 
         price = closes[-1]
 
-        # base direction candidate from 1h trend
         e50 = ema_val(closes, 50)
         e200 = ema_val(closes, min(200, len(closes) - 1))
-        base_dir = "LONG" if e50 > e200 else "SHORT"
+        direction = "LONG" if e50 > e200 else "SHORT"
 
-        # --- GATE 1 (mandatory): market structure - BOS or CHOCH ---
+        # --- mandatory gates (instant reject, no partial credit) ---
         structure = detect_structure(highs, lows, closes)
-        want_structure = {"LONG": ("BOS_UP", "CHOCH_UP"), "SHORT": ("BOS_DOWN", "CHOCH_DOWN")}[base_dir]
-        if structure not in want_structure:
+        want = {"LONG": ("BOS_UP", "CHOCH_UP"), "SHORT": ("BOS_DOWN", "CHOCH_DOWN")}[direction]
+        if structure not in want:
             return {"symbol": symbol, "signal": False, "reason": "no_structure_break"}
-
-        direction = base_dir
-
-        # --- GATE 2 (mandatory): entry zone - FVG or session liquidity ---
-        fvg_zones = detect_fvg_zones(highs, lows, closes)
-        in_zone = price_in_fvg(price, fvg_zones, direction) or near_session_liquidity(price, highs, lows)
-        if not in_zone:
-            return {"symbol": symbol, "signal": False, "reason": "no_entry_zone"}
-
-        # --- GATE 3 (need >=2 of 3): momentum confirmation ---
-        rsis = rsi_list(closes)
-        div_agree = rsi_divergence(closes, rsis, direction)
-
-        macd_now, signal_now, hist_now, macd_prev, hist_prev = macd_values(closes)
-        macd_agree = (macd_now > signal_now) if direction == "LONG" else (macd_now < signal_now)
-
-        srsi = stoch_rsi_val(closes)
-        stoch_agree = (srsi < 20) if direction == "LONG" else (srsi > 80)
-
-        momentum_votes = sum([div_agree, macd_agree, stoch_agree])
-        if momentum_votes < 2:
-            return {"symbol": symbol, "signal": False, "reason": "weak_momentum", "votes": momentum_votes}
-
-        # --- GATE 4 (mandatory, any one): volume / money-flow confirmation ---
-        obv_diff = obv_trend(closes, volumes)
-        obv_agree = (obv_diff > 0) if direction == "LONG" else (obv_diff < 0)
-
-        poc = volume_poc(closes, volumes)
-        poc_agree = False
-        if poc:
-            poc_agree = (price >= poc) if direction == "LONG" else (price <= poc)
-
-        fund_agree = funding_agree(symbol, direction)
-
-        if not (obv_agree or poc_agree or fund_agree):
-            return {"symbol": symbol, "signal": False, "reason": "no_volume_confirmation"}
-
-        # --- GATE 5 (mandatory): final filters ---
-        adx = adx_val(highs, lows, closes)
-        if adx and adx < 18:
-            return {"symbol": symbol, "signal": False, "reason": "low_adx", "adx": round(adx, 1)}
 
         higher_trend = htf_trend(symbol)
         if higher_trend is not None and higher_trend != direction:
@@ -529,45 +513,83 @@ def score_symbol(symbol):
         if not fear_greed_ok(direction, fng):
             return {"symbol": symbol, "signal": False, "reason": "fear_greed_extreme"}
 
-        # ATR-based SL/TP
+        adx = adx_val(highs, lows, closes)
+        if adx and adx < 18:
+            return {"symbol": symbol, "signal": False, "reason": "low_adx", "adx": round(adx, 1)}
+
+        # --- weighted scoring (0-100) ---
+        fvg_zones = detect_fvg_zones(highs, lows, closes)
+        entry_zone = price_in_fvg(price, fvg_zones, direction) or near_key_level(price, highs, lows)
+
+        ob_zone = find_order_block(highs, lows, closes, direction)
+        order_block_hit = price_in_zone(price, ob_zone)
+
+        sweep = detect_liquidity_sweep(highs, lows, closes, direction)
+        retest = detect_structure_retest(highs, lows, closes, direction)
+        premium_discount = premium_discount_ok(highs, lows, price, direction)
+
+        rsis = rsi_list(closes)
+        div = rsi_divergence(closes, rsis, direction)
+
+        macd_now, signal_now, hist_now, macd_prev, hist_prev = macd_values(closes)
+        macd_agree = (macd_now > signal_now) if direction == "LONG" else (macd_now < signal_now)
+
+        srsi = stoch_rsi_val(closes)
+        stoch_agree = (srsi < 20) if direction == "LONG" else (srsi > 80)
+
+        obv_diff = obv_trend(closes, volumes)
+        obv_agree = (obv_diff > 0) if direction == "LONG" else (obv_diff < 0)
+
+        poc = volume_poc(closes, volumes)
+        poc_agree = ((price >= poc) if direction == "LONG" else (price <= poc)) if poc else False
+
+        weights = {
+            "entry_zone": (entry_zone, 15),
+            "order_block": (order_block_hit, 15),
+            "liquidity_sweep": (sweep, 12),
+            "structure_retest": (retest, 10),
+            "premium_discount": (premium_discount, 10),
+            "rsi_divergence": (div, 10),
+            "macd": (macd_agree, 8),
+            "stoch_rsi": (stoch_agree, 8),
+            "obv": (obv_agree, 6),
+            "volume_poc": (poc_agree, 6),
+        }
+        score = sum(pts for ok, pts in weights.values() if ok)
+        score = min(100, round(score + min(adx, 30) * 0.0))  # adx already gated above, no double count
+
+        if score < MIN_SCORE:
+            return {"symbol": symbol, "signal": False, "reason": "low_score", "score": score}
+
         atr = atr_val(highs, lows, closes)
         if atr <= 0:
             atr = price * 0.01
 
         if direction == "LONG":
             sl = price - 1.5 * atr
-            tp1 = price + 2.0 * atr
-            tp2 = price + 3.5 * atr
+            tp1 = price + 1.5 * atr
+            tp2 = price + 2.5 * atr
+            tp3 = price + 4.0 * atr
         else:
             sl = price + 1.5 * atr
-            tp1 = price - 2.0 * atr
-            tp2 = price - 3.5 * atr
+            tp1 = price - 1.5 * atr
+            tp2 = price - 2.5 * atr
+            tp3 = price - 4.0 * atr
 
         risk = abs(price - sl)
         reward = abs(tp2 - price)
         rr = round(reward / risk, 2) if risk > 0 else 0
-
         if rr < 1.5:
             return {"symbol": symbol, "signal": False, "reason": "poor_rr", "rr": rr}
 
-        # confidence score: base on how many gates were exceeded (informational)
-        score = 60 + momentum_votes * 8 + (10 if structure.startswith("BOS") else 5) + min(adx, 30) * 0.3
-        score = min(round(score), 99)
-        probability = min(88, round(40 + score * 0.5 + min(adx, 40) * 0.2))
+        probability = min(90, round(40 + score * 0.4 + min(adx, 40) * 0.2))
 
         return {
-            "symbol": symbol,
-            "signal": True,
-            "dir": direction,
-            "structure": structure,
-            "score": score,
-            "price": round(price, 6),
-            "sl": round(sl, 6),
-            "tp1": round(tp1, 6),
-            "tp2": round(tp2, 6),
-            "rr": rr,
-            "adx": round(adx, 1),
-            "probability": probability,
+            "symbol": symbol, "signal": True, "dir": direction, "structure": structure,
+            "score": score, "grade": grade_for(score),
+            "price": round(price, 6), "sl": round(sl, 6),
+            "tp1": round(tp1, 6), "tp2": round(tp2, 6), "tp3": round(tp3, 6),
+            "rr": rr, "adx": round(adx, 1), "probability": probability,
         }
 
     except Exception as e:
@@ -575,7 +597,7 @@ def score_symbol(symbol):
         return {"symbol": symbol, "signal": False, "reason": "error", "detail": str(e)}
 
 
-# ================= GOOGLE SHEETS =================
+# ================= GOOGLE SHEETS (journal + reports) =================
 
 def sheets_call(method, params=None, json_body=None):
     if not SHEETS_URL or not SHEETS_SECRET:
@@ -605,12 +627,9 @@ def sheet_log_signal(s):
     sheets_call("POST", json_body={
         "action": "append",
         "data": {
-            "symbol": s["symbol"],
-            "dir": s["dir"],
-            "entry": s["price"],
-            "sl": s["sl"],
-            "tp1": s["tp1"],
-            "tp2": s["tp2"],
+            "symbol": s["symbol"], "dir": s["dir"], "entry": s["price"],
+            "sl": s["sl"], "tp1": s["tp1"], "tp2": s["tp2"], "tp3": s["tp3"],
+            "grade": s["grade"], "reason": s["structure"],
             "timestamp": iran_now().strftime("%Y-%m-%d %H:%M:%S"),
         }
     })
@@ -625,9 +644,7 @@ def sheet_update_status(row_id, status, closed_price):
     sheets_call("POST", json_body={
         "action": "update_status",
         "data": {
-            "id": row_id,
-            "status": status,
-            "closed_price": closed_price,
+            "id": row_id, "status": status, "closed_price": closed_price,
             "closed_time": iran_now().strftime("%Y-%m-%d %H:%M:%S"),
         }
     })
@@ -646,9 +663,34 @@ def sheet_set_meta(key, value):
     sheets_call("POST", json_body={"action": "set_meta", "data": {"key": key, "value": value}})
 
 
+# ================= KILL SWITCH =================
+
+def kill_switch_active():
+    until = sheet_get_meta("kill_switch_until")
+    if not until:
+        return False
+    try:
+        until_dt = datetime.fromisoformat(until)
+    except Exception:
+        return False
+    return iran_now() < until_dt
+
+
+def update_kill_switch(status):
+    if status == "SL HIT ❌":
+        count = int(sheet_get_meta("consecutive_losses") or 0) + 1
+        sheet_set_meta("consecutive_losses", str(count))
+        if count >= KILL_SWITCH_LOSSES:
+            until = iran_now() + timedelta(hours=KILL_SWITCH_COOLDOWN_HOURS)
+            sheet_set_meta("kill_switch_until", until.isoformat())
+            send(f"🛑 Kill Switch فعال شد ({count} ضرر متوالی) - سیگنال‌دهی تا {until.strftime('%H:%M')} متوقف شد")
+    else:
+        sheet_set_meta("consecutive_losses", "0")
+
+
+# ================= OPEN SIGNAL TRACKING =================
+
 def check_open_signals():
-    """Checks every OPEN signal's current price and % progress toward TP/SL.
-    Updates status in the sheet if TP/SL was hit. Returns status lines."""
     open_rows = sheet_list_open()
     lines = []
 
@@ -659,15 +701,19 @@ def check_open_signals():
         sl = float(row.get("sl", 0))
         tp1 = float(row.get("tp1", 0))
         tp2 = float(row.get("tp2", 0))
+        tp3 = float(row.get("tp3", tp2))
 
-        closes, _, _, _ = candles(symbol, tf="15m", limit=2)
+        closes, _, _, _ = candles(symbol, tf="15min", limit=2)
         if not closes:
             continue
         price = closes[-1]
 
         status = None
+        progress = 0
         if direction == "LONG":
-            if price >= tp2:
+            if price >= tp3:
+                status = "TP3 HIT ✅"
+            elif price >= tp2:
                 status = "TP2 HIT ✅"
             elif price >= tp1:
                 status = "TP1 HIT ✅"
@@ -676,7 +722,9 @@ def check_open_signals():
             else:
                 progress = round((price - entry) / (tp2 - entry) * 100, 1) if tp2 != entry else 0
         else:
-            if price <= tp2:
+            if price <= tp3:
+                status = "TP3 HIT ✅"
+            elif price <= tp2:
                 status = "TP2 HIT ✅"
             elif price <= tp1:
                 status = "TP1 HIT ✅"
@@ -687,6 +735,7 @@ def check_open_signals():
 
         if status:
             sheet_update_status(row.get("id"), status, price)
+            update_kill_switch(status)
             lines.append(f"{symbol} ({direction}): {status} @ {price}")
         else:
             lines.append(f"{symbol} ({direction}): {progress}% تا TP، قیمت الان {price}")
@@ -694,11 +743,11 @@ def check_open_signals():
     return lines
 
 
-# ================= WEEKLY REPORT (Iran time, Thursday evening) =================
+# ================= WEEKLY REPORT (Friday 22:00 Iran time) =================
 
 def is_weekly_report_window():
     t = iran_now()
-    return t.weekday() == 3 and 20 <= t.hour < 22  # Mon=0 -> Thursday=3
+    return t.weekday() == 4 and t.hour == 22  # Mon=0 -> Friday=4
 
 
 def send_weekly_report_if_due():
@@ -710,12 +759,16 @@ def send_weekly_report_if_due():
 
     stats = sheet_weekly_stats()
     if stats:
+        total = stats.get("total", 0)
+        tp_hits = stats.get("tp_hits", 0)
+        win_rate = round(tp_hits / total * 100, 1) if total else 0
         send(
             f"📅 گزارش هفتگی\n"
-            f"تعداد کل سیگنال: {stats.get('total', 0)}\n"
-            f"✅ TP خورده: {stats.get('tp_hits', 0)}\n"
+            f"تعداد کل سیگنال: {total}\n"
+            f"✅ TP خورده: {tp_hits}\n"
             f"❌ SL خورده: {stats.get('sl_hits', 0)}\n"
-            f"🕒 هنوز باز: {stats.get('open', 0)}"
+            f"🕒 هنوز باز: {stats.get('open', 0)}\n"
+            f"📈 وین‌ریت: {win_rate}%"
         )
         sheet_set_meta("last_weekly_report", week_marker)
 
@@ -736,63 +789,23 @@ def send(msg):
         print("[TELEGRAM ERROR]", e)
 
 
-def send_photo(image_bytes, caption):
-    if not TOKEN or not CHAT_ID or not image_bytes:
-        return False
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendPhoto",
-            data={"chat_id": CHAT_ID, "caption": caption},
-            files={"photo": ("chart.png", image_bytes)},
-            timeout=20
-        )
-        return r.status_code == 200
-    except Exception as e:
-        print("[TELEGRAM PHOTO ERROR]", e)
-        return False
-
-
-def get_chart_image(symbol):
-    """Best-effort chart-img.com snapshot. Needs CHART_IMG_KEY secret set.
-    NOTE: exact params/exchange-prefix aren't verified here - check
-    [CHART IMG ERROR] logs if it never sends photos and adjust as needed.
-    If the free quota is exhausted (402/429), this returns None and the bot
-    just falls back to text-only signals automatically."""
-    if not CHART_IMG_KEY:
-        return None
-    try:
-        r = session.get(
-            "https://api.chart-img.com/v1/tradingview/advanced-chart",
-            params={"symbol": f"BINANCE:{symbol}", "interval": "1h", "key": CHART_IMG_KEY},
-            timeout=15
-        )
-        if r.status_code == 200:
-            return r.content
-        if r.status_code in (402, 429):
-            print("[CHART IMG] free quota likely exhausted - sending text-only from now on")
-        else:
-            print(f"[CHART IMG ERROR] HTTP {r.status_code}")
-        return None
-    except Exception as e:
-        print("[CHART IMG ERROR]", e)
-        return None
-
-
 def fmt(s):
     direction_emoji = "📈" if s["dir"] == "LONG" else "📉"
     side_word = "LONG" if s["dir"] == "LONG" else "SELL"
     side_mark = "🟢🟢" if s["dir"] == "LONG" else "🔴🔴"
 
-    entry, sl, tp1, tp2 = s["price"], s["sl"], s["tp1"], s["tp2"]
+    entry, sl, tp1, tp2, tp3 = s["price"], s["sl"], s["tp1"], s["tp2"], s["tp3"]
 
     if s["dir"] == "LONG":
         sl_pct = round((entry - sl) / entry * 100, 2)
         tp1_pct = round((tp1 - entry) / entry * 100, 2)
         tp2_pct = round((tp2 - entry) / entry * 100, 2)
+        tp3_pct = round((tp3 - entry) / entry * 100, 2)
     else:
         sl_pct = round((sl - entry) / entry * 100, 2)
         tp1_pct = round((entry - tp1) / entry * 100, 2)
         tp2_pct = round((entry - tp2) / entry * 100, 2)
+        tp3_pct = round((entry - tp3) / entry * 100, 2)
 
     tehran_str = iran_now().strftime("%Y-%m-%d %H:%M")
 
@@ -800,15 +813,16 @@ def fmt(s):
 
 {side_mark} {side_word} {direction_emoji}
 Symbol: {s['symbol']}
-Structure: {s['structure']}
+Structure: {s['structure']}  |  Grade: {s['grade']}
 
-🏆 Confidence: {s['score']}%
+🏆 Confidence: {s['score']}/100
 📊 ADX: {s['adx']}
 🎲 Est. TP Probability: {s['probability']}%
 💰 Entry: {entry}
 🛑 SL: {sl}  (-{sl_pct}%)
 🎯 TP1: {tp1}  (+{tp1_pct}%)
 🎯 TP2: {tp2}  (+{tp2_pct}%)
+🎯 TP3: {tp3}  (+{tp3_pct}%)
 📐 R:R  1:{s['rr']}
 🕒 {tehran_str} (تهران)
 
@@ -819,6 +833,10 @@ Structure: {s['structure']}
 # ================= SCAN =================
 
 def run_scan():
+    if kill_switch_active():
+        print("Kill switch active - skipping new signal scan")
+        return
+
     symbols = get_top_symbols(TOP_N)
     print(f"Scanning {len(symbols)} symbols...")
 
@@ -849,11 +867,7 @@ def run_scan():
 
     if top_signals:
         for signal in top_signals:
-            caption = fmt(signal)
-            image = get_chart_image(signal["symbol"])
-            sent_photo = send_photo(image, caption) if image else False
-            if not sent_photo:
-                send(caption)
+            send(fmt(signal))
             sheet_log_signal(signal)
     else:
         breakdown = ", ".join(f"{r}: {c}" for r, c in reason_counts.items())
@@ -865,17 +879,15 @@ def run_scan():
 # ================= MAIN LOOP =================
 
 def main():
-    print("ADVANCED ICT SIGNAL BOT STARTED")
+    print("ICT SIGNAL BOT STARTED")
     tick = 0
 
     while True:
         try:
-            # every hour: report status of open signals
             lines = check_open_signals()
             if lines:
                 send("📋 آپدیت ساعتی سیگنال‌های باز:\n" + "\n".join(lines))
 
-            # every 2 hours: full scan for new signals
             if tick % 2 == 0:
                 run_scan()
 
@@ -885,7 +897,7 @@ def main():
             print("[BOT ERROR]", e)
 
         tick += 1
-        time.sleep(3600)  # 1 hour
+        time.sleep(3600)
 
 
 if __name__ == "__main__":
