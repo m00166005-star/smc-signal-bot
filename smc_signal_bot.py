@@ -1,5 +1,4 @@
 import os
-import time
 import requests
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
@@ -876,28 +875,27 @@ def run_scan():
     send(f"SCAN DONE {iran_now()}")
 
 
-# ================= MAIN LOOP =================
+# ================= MAIN (single run - triggered by GitHub Actions cron every hour) =================
 
 def main():
-    print("ICT SIGNAL BOT STARTED")
-    tick = 0
+    print("SIGNAL BOT - single run started")
+    try:
+        # always check open signals (hourly status update)
+        lines = check_open_signals()
+        if lines:
+            send("📋 آپدیت ساعتی سیگنال‌های باز:\n" + "\n".join(lines))
 
-    while True:
-        try:
-            lines = check_open_signals()
-            if lines:
-                send("📋 آپدیت ساعتی سیگنال‌های باز:\n" + "\n".join(lines))
+        # only look for NEW signals every 2 hours (even UTC hours)
+        if datetime.utcnow().hour % 2 == 0:
+            run_scan()
 
-            if tick % 2 == 0:
-                run_scan()
+        send_weekly_report_if_due()
 
-            send_weekly_report_if_due()
+    except Exception as e:
+        print("[BOT ERROR]", e)
+        send(f"⚠️ خطای کلی ربات: {e}")
 
-        except Exception as e:
-            print("[BOT ERROR]", e)
-
-        tick += 1
-        time.sleep(3600)
+    print("SIGNAL BOT - run finished")
 
 
 if __name__ == "__main__":
